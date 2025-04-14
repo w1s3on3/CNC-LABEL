@@ -147,7 +147,7 @@ def toggle_snap():
 
 # --- GUI Setup ---
 root = tk.Tk()
-root.title("CNC Label Maker - TTF Full Version")
+root.title("CNC Label Maker - 2025 Paul Wyers")
 
 Label(root, text="Labels (one per line):").grid(row=0, column=0, sticky="e")
 entry = tk.Text(root, height=4, width=50)

@@ -72,7 +72,7 @@ The GUI saves user preferences to `machine_settings.json`. You can edit this fil
 
 ---
 
-## 🆕 TTF GUI Version (New)
+## 🆕 GUI Version
 
 ### ✅ Usage Notes
 - Use one label per line (no commas needed)
@@ -93,7 +93,7 @@ A modernized version using **TrueType fonts** for accurate rendering, cutouts, a
 
 ### ▶️ Run It
 ```bash
-python ttf_label_maker.py
+python create_gui.py
 ```
 
 No font conversion required — just pick any installed font and go.
