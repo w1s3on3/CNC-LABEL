@@ -63,7 +63,7 @@ python cnc_label_maker_gui.py
 ## ✍️ Customization
 
 **Font**:  
-Edit or expand `font dict/normalized_full_font.json` to add new characters or styles.
+Edit or expand `font/normalized_full_font.json` to add new characters or styles.
 
 **Settings**:  
 The GUI saves user preferences to `machine_settings.json`. You can edit this file directly or reset by deleting it.
@@ -72,6 +72,8 @@ The GUI saves user preferences to `machine_settings.json`. You can edit this fil
 
 ## 📦 Coming Soon
 
+- [ ] Multiline Support
+- [ ] Multi Font / Style Support
 - [ ] SVG export
 - [ ] Barcode & QR code support
 - [ ] Font switching
