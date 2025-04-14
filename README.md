@@ -11,7 +11,7 @@ CNC-Label-Maker/
 ├── console/                # Console-based G-code generator
 │   └── create.py
 ├── GUI/                    # GUI version with live preview and settings
-│   └── cnc_label_maker_gui.py
+│   └── create_gui.py
 ├── fonts/                  # Stroke font file (JSON) (CONSOLE VERSION)
 │   └── normalized_full_font.json
 └── machine_settings.json   # Auto-generated after running GUI
@@ -50,7 +50,7 @@ Follow the prompts to enter labels and generate individual `.gcode` files.
 ### 🖱 GUI Version:
 ```bash
 cd GUI
-python cnc_label_maker_gui.py
+python create_gui.py
 ```
 - Type your labels (one per line)
 - Click **Preview** to see layout
