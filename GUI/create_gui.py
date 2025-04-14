@@ -14,178 +14,71 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import tkinter as tk
-from tkinter import messagebox, filedialog, Toplevel
-import json
 import os
+import json
+import tkinter as tk
+from tkinter import StringVar, OptionMenu, Label, Canvas
 
-SETTINGS_FILE = "machine_settings.json"
+FONT_DIR = "fonts"
+FONT_HEIGHT_MM = 10
 
-DEFAULTS = {
-    "TEXT_DEPTH": -0.2,
-    "CUT_DEPTH": -0.8,
-    "PASS_DEPTH": -0.2,
-    "SAFE_Z": 5,
-    "FEED_RATE_ENGRAVE": 300,
-    "FEED_RATE_CUT": 200,
-    "PADDING": 10,
-    "GRID_CELL_HEIGHT": 40,
-    "CHAR_SPACING": 2,
-    "LETTER_SPACING": 10,
-    "LINE_SPACING": 12
-}
+def list_available_fonts():
+    return [f for f in os.listdir(FONT_DIR) if f.endswith(".json")]
 
-settings = DEFAULTS.copy()
+def load_selected_font(name):
+    path = os.path.join(FONT_DIR, name)
+    with open(path, "r") as f:
+        return json.load(f)
 
-if os.path.exists(SETTINGS_FILE):
-    with open(SETTINGS_FILE) as f:
-        settings.update(json.load(f))
-
-with open("normalized_full_font.json") as f:
-    FONT = json.load(f)
-
-def draw_letter(char, offset_x, offset_y, gcode_mode=True):
-    gcode = []
-    strokes = FONT.get(char)
-    if not strokes:
-        return []
-    for (x1, y1), (x2, y2) in strokes:
-        if gcode_mode:
-            gcode.append(f"G0 X{offset_x + x1:.2f} Y{offset_y + y1:.2f}")
-            gcode.append(f"G1 Z{settings['TEXT_DEPTH']:.2f} F{settings['FEED_RATE_ENGRAVE']}")
-            gcode.append(f"G1 X{offset_x + x2:.2f} Y{offset_y + y2:.2f}")
-            gcode.append(f"G1 Z{settings['SAFE_Z']:.2f}")
-        else:
-            gcode.append(((offset_x + x1, offset_y + y1), (offset_x + x2, offset_y + y2)))
-    return gcode
-
-def generate_grid_gcode(labels, filename, columns=3, spacing_x=20, spacing_y=20):
-    gcode = [
-        "G21 ; mm",
-        "G90 ; absolute",
-        f"G1 Z{settings['SAFE_Z']:.2f} F{settings['FEED_RATE_ENGRAVE']}",
-        "( Start Grid Layout )",
-        "M3 S1000 ; Start spindle"
+def scale_strokes(strokes, scale):
+    return [
+        [[(x * scale, y * scale) for x, y in segment] for segment in char_strokes]
+        for char_strokes in strokes
     ]
-    row = col = 0
 
-    for idx, label in enumerate(labels):
-        text_width = len(label) * (settings['LETTER_SPACING'] + settings['CHAR_SPACING']) - settings['CHAR_SPACING']
-        cell_width = text_width + 2 * settings['PADDING']
-        row = idx // columns
-        col = idx % columns
-        base_x = col * (cell_width + spacing_x)
-        base_y = row * (settings['GRID_CELL_HEIGHT'] + spacing_y)
-        start_y = base_y + (settings['GRID_CELL_HEIGHT'] - settings['LINE_SPACING']) / 2
-        start_x = base_x + (cell_width - text_width) / 2
+def get_scaled_char(char, font_dict, height_mm):
+    char_strokes = font_dict.get(char.upper())
+    if not char_strokes:
+        return []
+    base_height = 15
+    scale = height_mm / base_height
+    return scale_strokes([char_strokes], scale)[0]
 
-        gcode.append(f"( Label {idx+1}: '{label}' at row {row}, col {col} )")
-        for i, char in enumerate(label):
-            offset = start_x + i * (settings['LETTER_SPACING'] + settings['CHAR_SPACING'])
-            gcode += draw_letter(char, offset, start_y)
-
-        passes = int(abs(settings['CUT_DEPTH']) / abs(settings['PASS_DEPTH']))
-        for p in range(1, passes + 1):
-            z = p * settings['PASS_DEPTH']
-            gcode += [
-                f"( Cut Label {idx+1} Pass {p} )",
-                f"G0 X{base_x:.2f} Y{base_y:.2f}",
-                f"G1 Z{z:.2f} F{settings['FEED_RATE_CUT']}",
-                f"G1 X{base_x + cell_width:.2f} Y{base_y:.2f}",
-                f"G1 X{base_x + cell_width:.2f} Y{base_y + settings['GRID_CELL_HEIGHT']:.2f}",
-                f"G1 X{base_x:.2f} Y{base_y + settings['GRID_CELL_HEIGHT']:.2f}",
-                f"G1 X{base_x:.2f} Y{base_y:.2f}",
-                f"G1 Z{settings['SAFE_Z']:.2f}"
-            ]
-
-    gcode.append("M5 ; Stop spindle")
-    gcode.append("M30 ; End of job")
-    os.makedirs("output", exist_ok=True)
-    with open(filename, "w") as f:
-        f.write("\n".join(gcode))
-
-def draw_preview(canvas, labels, columns=3, show_cuts=True):
+def draw_text(canvas, text, font_dict, font_height):
     canvas.delete("all")
-    spacing_x = 20
-    spacing_y = 20
-    for idx, label in enumerate(labels):
-        text_width = len(label) * (settings['LETTER_SPACING'] + settings['CHAR_SPACING']) - settings['CHAR_SPACING']
-        cell_width = text_width + 2 * settings['PADDING']
-        row = idx // columns
-        col = idx % columns
-        base_x = col * (cell_width + spacing_x)
-        base_y = row * (settings['GRID_CELL_HEIGHT'] + spacing_y)
-        start_y = base_y + (settings['GRID_CELL_HEIGHT'] - settings['LINE_SPACING']) / 2
-        start_x = base_x + (cell_width - text_width) / 2
+    x_offset = 10
+    for char in text:
+        strokes = get_scaled_char(char, font_dict, font_height)
+        for segment in strokes:
+            for i in range(len(segment) - 1):
+                x1, y1 = segment[i]
+                x2, y2 = segment[i+1]
+                canvas.create_line(x1 + x_offset, 150 - y1, x2 + x_offset, 150 - y2)
+        x_offset += font_height
 
-        for i, char in enumerate(label):
-            strokes = draw_letter(char, start_x + i * (settings['LETTER_SPACING'] + settings['CHAR_SPACING']), start_y, gcode_mode=False)
-            for (x1, y1), (x2, y2) in strokes:
-                canvas.create_line(x1, 400 - y1, x2, 400 - y2, fill="red")
-
-        if show_cuts:
-            canvas.create_rectangle(
-                base_x, 400 - base_y,
-                base_x + cell_width, 400 - (base_y + settings['GRID_CELL_HEIGHT']),
-                outline="black"
-            )
-
-def update_preview():
-    labels = label_input.get("1.0", tk.END).strip().splitlines()
-    draw_preview(preview_canvas, labels, show_cuts=show_cut.get())
-
-def generate_gcode():
-    labels = label_input.get("1.0", tk.END).strip().splitlines()
-    if not labels:
-        messagebox.showerror("Error", "Enter at least one label.")
-        return
-    filename = filedialog.asksaveasfilename(defaultextension=".gcode", filetypes=[("G-code files", "*.gcode")])
-    if not filename:
-        return
-    generate_grid_gcode(labels, filename)
-    messagebox.showinfo("Done", f"G-code saved to:\n{filename}")
-
-def open_settings():
-    win = Toplevel(root)
-    win.title("Machine Settings")
-    entries = {}
-    for i, (key, val) in enumerate(settings.items()):
-        tk.Label(win, text=key).grid(row=i, column=0, sticky="w")
-        e = tk.Entry(win)
-        e.insert(0, str(val))
-        e.grid(row=i, column=1)
-        entries[key] = e
-
-    def save():
-        for k in entries:
-            try:
-                settings[k] = float(entries[k].get())
-            except ValueError:
-                pass
-        with open(SETTINGS_FILE, "w") as f:
-            json.dump(settings, f, indent=2)
-        win.destroy()
-        update_preview()
-
-    tk.Button(win, text="Save", command=save).grid(row=len(settings), columnspan=2)
+def update_preview(*args):
+    text = entry.get()
+    font_dict = load_selected_font(selected_font.get())
+    draw_text(canvas, text, font_dict, FONT_HEIGHT_MM)
 
 root = tk.Tk()
 root.title("CNC Label Maker")
 
-tk.Label(root, text="Enter labels (one per line):").pack()
-label_input = tk.Text(root, height=6, width=50)
-label_input.pack()
+Label(root, text="Enter Text:").grid(row=0, column=0)
+entry = tk.Entry(root)
+entry.grid(row=0, column=1)
 
-button_frame = tk.Frame(root)
-button_frame.pack(pady=5)
-tk.Button(button_frame, text="Settings ⚙️", command=open_settings).pack(side=tk.LEFT, padx=5)
-tk.Button(button_frame, text="Preview", command=update_preview).pack(side=tk.LEFT, padx=5)
-tk.Button(button_frame, text="Export G-code", command=generate_gcode).pack(side=tk.LEFT, padx=5)
+Label(root, text="Select Font:").grid(row=1, column=0)
+selected_font = StringVar()
+fonts = list_available_fonts()
+selected_font.set(fonts[0])
+font_dropdown = OptionMenu(root, selected_font, *fonts)
+font_dropdown.grid(row=1, column=1)
 
-show_cut = tk.BooleanVar(value=True)
-tk.Checkbutton(root, text="Show Cut Paths in Preview", variable=show_cut, command=update_preview).pack()
+canvas = Canvas(root, width=800, height=200, bg="white")
+canvas.grid(row=2, column=0, columnspan=2, pady=10)
 
-preview_canvas = tk.Canvas(root, width=700, height=400, bg="white")
-preview_canvas.pack()
+entry.bind("<KeyRelease>", update_preview)
+selected_font.trace("w", update_preview)
 
 root.mainloop()
