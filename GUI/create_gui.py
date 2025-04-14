@@ -19,10 +19,8 @@ from tkinter import messagebox, filedialog, Toplevel
 import json
 import os
 
-# Default Settings File
 SETTINGS_FILE = "machine_settings.json"
 
-# Default Parameters
 DEFAULTS = {
     "TEXT_DEPTH": -0.2,
     "CUT_DEPTH": -0.8,
@@ -31,20 +29,18 @@ DEFAULTS = {
     "FEED_RATE_ENGRAVE": 300,
     "FEED_RATE_CUT": 200,
     "PADDING": 10,
-    "GRID_CELL_WIDTH": 80,
-    "GRID_CELL_HEIGHT": 30,
+    "GRID_CELL_HEIGHT": 40,
     "CHAR_SPACING": 2,
-    "LETTER_SPACING": 10
+    "LETTER_SPACING": 10,
+    "LINE_SPACING": 12
 }
 
 settings = DEFAULTS.copy()
 
-# Load settings from JSON
 if os.path.exists(SETTINGS_FILE):
     with open(SETTINGS_FILE) as f:
         settings.update(json.load(f))
 
-# Load font
 with open("normalized_full_font.json") as f:
     FONT = json.load(f)
 
@@ -68,21 +64,23 @@ def generate_grid_gcode(labels, filename, columns=3, spacing_x=20, spacing_y=20)
         "G21 ; mm",
         "G90 ; absolute",
         f"G1 Z{settings['SAFE_Z']:.2f} F{settings['FEED_RATE_ENGRAVE']}",
-        "( Start Grid Layout )"
+        "( Start Grid Layout )",
+        "M3 S1000 ; Start spindle"
     ]
     row = col = 0
 
-    for idx, text in enumerate(labels):
-        base_x = col * (settings['GRID_CELL_WIDTH'] + spacing_x)
+    for idx, label in enumerate(labels):
+        text_width = len(label) * (settings['LETTER_SPACING'] + settings['CHAR_SPACING']) - settings['CHAR_SPACING']
+        cell_width = text_width + 2 * settings['PADDING']
+        row = idx // columns
+        col = idx % columns
+        base_x = col * (cell_width + spacing_x)
         base_y = row * (settings['GRID_CELL_HEIGHT'] + spacing_y)
+        start_y = base_y + (settings['GRID_CELL_HEIGHT'] - settings['LINE_SPACING']) / 2
+        start_x = base_x + (cell_width - text_width) / 2
 
-        text_width = len(text) * (settings['LETTER_SPACING'] + settings['CHAR_SPACING']) - settings['CHAR_SPACING']
-        start_x = base_x + (settings['GRID_CELL_WIDTH'] - text_width) / 2
-        start_y = base_y + (settings['GRID_CELL_HEIGHT'] - 10) / 2
-
-        gcode.append(f"( Label {idx+1}: '{text}' at row {row}, col {col} )")
-
-        for i, char in enumerate(text):
+        gcode.append(f"( Label {idx+1}: '{label}' at row {row}, col {col} )")
+        for i, char in enumerate(label):
             offset = start_x + i * (settings['LETTER_SPACING'] + settings['CHAR_SPACING'])
             gcode += draw_letter(char, offset, start_y)
 
@@ -93,18 +91,14 @@ def generate_grid_gcode(labels, filename, columns=3, spacing_x=20, spacing_y=20)
                 f"( Cut Label {idx+1} Pass {p} )",
                 f"G0 X{base_x:.2f} Y{base_y:.2f}",
                 f"G1 Z{z:.2f} F{settings['FEED_RATE_CUT']}",
-                f"G1 X{base_x + settings['GRID_CELL_WIDTH']:.2f} Y{base_y:.2f}",
-                f"G1 X{base_x + settings['GRID_CELL_WIDTH']:.2f} Y{base_y + settings['GRID_CELL_HEIGHT']:.2f}",
+                f"G1 X{base_x + cell_width:.2f} Y{base_y:.2f}",
+                f"G1 X{base_x + cell_width:.2f} Y{base_y + settings['GRID_CELL_HEIGHT']:.2f}",
                 f"G1 X{base_x:.2f} Y{base_y + settings['GRID_CELL_HEIGHT']:.2f}",
                 f"G1 X{base_x:.2f} Y{base_y:.2f}",
                 f"G1 Z{settings['SAFE_Z']:.2f}"
             ]
 
-        col += 1
-        if col >= columns:
-            col = 0
-            row += 1
-
+    gcode.append("M5 ; Stop spindle")
     gcode.append("M30 ; End of job")
     os.makedirs("output", exist_ok=True)
     with open(filename, "w") as f:
@@ -114,16 +108,17 @@ def draw_preview(canvas, labels, columns=3, show_cuts=True):
     canvas.delete("all")
     spacing_x = 20
     spacing_y = 20
-    for idx, text in enumerate(labels):
+    for idx, label in enumerate(labels):
+        text_width = len(label) * (settings['LETTER_SPACING'] + settings['CHAR_SPACING']) - settings['CHAR_SPACING']
+        cell_width = text_width + 2 * settings['PADDING']
         row = idx // columns
         col = idx % columns
-        base_x = col * (settings['GRID_CELL_WIDTH'] + spacing_x)
+        base_x = col * (cell_width + spacing_x)
         base_y = row * (settings['GRID_CELL_HEIGHT'] + spacing_y)
-        text_width = len(text) * (settings['LETTER_SPACING'] + settings['CHAR_SPACING']) - settings['CHAR_SPACING']
-        start_x = base_x + (settings['GRID_CELL_WIDTH'] - text_width) / 2
-        start_y = base_y + (settings['GRID_CELL_HEIGHT'] - 10) / 2
+        start_y = base_y + (settings['GRID_CELL_HEIGHT'] - settings['LINE_SPACING']) / 2
+        start_x = base_x + (cell_width - text_width) / 2
 
-        for i, char in enumerate(text):
+        for i, char in enumerate(label):
             strokes = draw_letter(char, start_x + i * (settings['LETTER_SPACING'] + settings['CHAR_SPACING']), start_y, gcode_mode=False)
             for (x1, y1), (x2, y2) in strokes:
                 canvas.create_line(x1, 400 - y1, x2, 400 - y2, fill="red")
@@ -131,7 +126,7 @@ def draw_preview(canvas, labels, columns=3, show_cuts=True):
         if show_cuts:
             canvas.create_rectangle(
                 base_x, 400 - base_y,
-                base_x + settings['GRID_CELL_WIDTH'], 400 - (base_y + settings['GRID_CELL_HEIGHT']),
+                base_x + cell_width, 400 - (base_y + settings['GRID_CELL_HEIGHT']),
                 outline="black"
             )
 
@@ -174,7 +169,6 @@ def open_settings():
 
     tk.Button(win, text="Save", command=save).grid(row=len(settings), columnspan=2)
 
-# GUI Layout
 root = tk.Tk()
 root.title("CNC Label Maker")
 
