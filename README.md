@@ -1,4 +1,3 @@
-
 # 🪪 CNC Label Maker
 
 The **CNC Label Maker** is a free, open-source tool that generates G-code for traffolyte-style labels using a custom stroke font. It supports both **console** and **GUI** versions, with live preview, customizable machine settings, and flexible grid layouts.
@@ -13,7 +12,7 @@ CNC-Label-Maker/
 │   └── create.py
 ├── GUI/                    # GUI version with live preview and settings
 │   └── cnc_label_maker_gui.py
-├── font dict/              # Stroke font file (JSON)
+├── fonts/                  # Stroke font file (JSON) (CONSOLE VERSION)
 │   └── normalized_full_font.json
 └── machine_settings.json   # Auto-generated after running GUI
 ```
@@ -69,6 +68,36 @@ Edit or expand `font/normalized_full_font.json` to add new characters or styles.
 The GUI saves user preferences to `machine_settings.json`. You can edit this file directly or reset by deleting it.
 
 ---
+
+
+---
+
+## 🆕 TTF GUI Version (New)
+
+### ✅ Usage Notes
+- Use one label per line (no commas needed)
+- Multi-word labels supported
+- Text is centered in each label cutout
+- Toggle Grid Snap for precision
+- Mouse scroll to zoom, Reset button to restore
+
+A modernized version using **TrueType fonts** for accurate rendering, cutouts, and export.
+
+### ✨ Features
+- 🅰️ Uses system-installed TTF fonts (e.g., Arial, DIN)
+- ✂️ G-code generation for text + label cutouts
+- 🔍 Zoom with mouse scroll
+- 🔲 Grid snapping (toggle on/off)
+- 📤 SVG export with outlines and cut boxes
+- ⚙️ Settings panel for depths, spacing, tool mode (Spindle or Laser)
+
+### ▶️ Run It
+```bash
+python ttf_label_maker.py
+```
+
+No font conversion required — just pick any installed font and go.
+
 
 ## 📦 Coming Soon
 
