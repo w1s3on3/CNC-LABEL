@@ -20,13 +20,18 @@ import tkinter as tk
 from tkinter import StringVar, OptionMenu, Label, Canvas, Entry, Toplevel, Button, Checkbutton, filedialog, messagebox
 from matplotlib.font_manager import FontProperties, findSystemFonts
 from matplotlib.textpath import TextPath
+from matplotlib.path import Path
 import numpy as np
+from shapely.geometry import Polygon, LineString
+from shapely.ops import unary_union, polygonize
+import shapely.affinity  
+
 
 SETTINGS_FILE = "machine_settings.json"
 
 cnc_settings = {
     "text_cut_depth": 0.2,
-    "label_cutout_depth": 1.6,
+    "label_cutout_depth": 0.8,
     "tool_diameter": 0.3,
     "safe_z": 5.0,
     "feed_rate": 300,
@@ -71,6 +76,28 @@ selected_font_path = [list(system_fonts.values())[0]]
 def snap(val, grid=5):
     return round(val / grid) * grid if grid_snapping[0] else val
 
+def hatch_fill(poly, spacing=0.3):
+    from shapely.geometry import LineString
+    bounds = poly.bounds
+    ymin, ymax = bounds[1], bounds[3]
+    hatch_lines = []
+    y = ymin - spacing
+    while y < ymax + spacing:
+        line = LineString([(bounds[0]-1, y), (bounds[2]+1, y)])
+        intersection = poly.intersection(line)
+        if intersection.is_empty:
+            y += spacing
+            continue
+        if intersection.geom_type == 'MultiLineString':
+            for geom in intersection.geoms:
+                x0, y0, x1, y1 = geom.bounds
+                hatch_lines.append(((x0, y0), (x1, y1)))
+        elif intersection.geom_type == 'LineString':
+            x0, y0, x1, y1 = intersection.bounds
+            hatch_lines.append(((x0, y0), (x1, y1)))
+        y += spacing
+    return hatch_lines
+
 def update_preview():
     canvas.delete("all")
     CANVAS_WIDTH = cnc_settings["material_width"]
@@ -94,20 +121,47 @@ def update_preview():
     for label in labels:
         tp = TextPath((0, 0), label, prop=FontProperties(fname=font_path, size=font_height * zoom))
         bbox = tp.get_extents()
-        width = bbox.width
-        height = bbox.height
+        width, height = bbox.width, bbox.height
         x = snap((CANVAS_WIDTH - width) / 2)
         y = snap(y_start)
 
-        for poly in tp.to_polygons():
-            poly = np.array(poly)
-            poly[:, 1] *= -1  # Flip Y
-            poly[:, 0] += x
-            poly[:, 1] += y
-            for i in range(len(poly) - 1):
-                x1, y1 = poly[i]
-                x2, y2 = poly[i + 1]
-                canvas.create_line(x1, y1, x2, y2, fill="red")
+        # Convert TextPath to shapely polygons directly
+        polys = [Polygon(poly) for poly in tp.to_polygons()]
+        merged_poly = unary_union(polys).buffer(0)  # Correct geometry
+
+        def draw_shapely_polygon(poly):
+            if poly.geom_type == 'Polygon':
+                exterior = np.array(poly.exterior.coords)
+                exterior[:, 1] *= -1
+                exterior[:, 0] += x
+                exterior[:, 1] += y
+                flat_exterior = [c for point in exterior for c in point]
+                canvas.create_polygon(flat_exterior, fill="black", outline="black")
+
+                for interior in poly.interiors:
+                    hole = np.array(interior.coords)
+                    hole[:, 1] *= -1
+                    hole[:, 0] += x
+                    hole[:, 1] += y
+                    flat_hole = [c for point in hole for c in point]
+                    canvas.create_polygon(flat_hole, fill="white", outline="white")
+
+            elif poly.geom_type == 'MultiPolygon':
+                for sub_poly in poly.geoms:
+                    draw_shapely_polygon(sub_poly)
+
+        if fill_text_var.get():
+            draw_shapely_polygon(merged_poly)
+        else:
+            for poly in polys:
+                poly_np = np.array(poly.exterior.coords)
+                poly_np[:, 1] *= -1
+                poly_np[:, 0] += x
+                poly_np[:, 1] += y
+                for i in range(len(poly_np) - 1):
+                    x1, y1 = poly_np[i]
+                    x2, y2 = poly_np[i + 1]
+                    canvas.create_line(x1, y1, x2, y2, fill="red")
 
         canvas.create_rectangle(
             x - padding, y - height - padding,
@@ -117,12 +171,9 @@ def update_preview():
 
         y_start += height + spacing + padding * 2
         if y_start > CANVAS_HEIGHT - 100:
-            canvas.create_text(
-                CANVAS_WIDTH / 2, y_start,
-                text="Warning: Labels exceed material height",
-                fill="orange"
-            )
+            canvas.create_text(CANVAS_WIDTH / 2, y_start, text="Warning: Labels exceed material height", fill="orange")
             break
+
 
 def open_settings():
     win = Toplevel(root)
@@ -180,65 +231,74 @@ def generate_gcode():
     padding = cnc_settings["cutout_padding"]
     labels = [lbl.strip().rstrip(",") for lbl in text.splitlines() if lbl.strip()]
     gcode = []
-    y_start = 0
+    y_start = 40  # Start 40mm from the top, consistent with preview
 
-    gcode.append("G21 ; Set units to mm")
-    gcode.append("G90 ; Absolute positioning")
-    if cnc_settings["tool_mode"] == "Spindle":
-        gcode.append("M3 S10000 ; Start spindle")
-    else:
-        gcode.append("M3 S100 ; Set laser power")
+    gcode.append("G21 ; mm mode")
+    gcode.append("G90 ; absolute positioning")
     gcode.append(f"G0 Z{cnc_settings['safe_z']}")
+
+    if cnc_settings["tool_mode"] == "Spindle":
+        gcode.append("M3 S10000 ; spindle on")
+    else:
+        gcode.append("M3 S100 ; laser on")
 
     for label in labels:
         tp = TextPath((0, 0), label, prop=FontProperties(fname=font_path, size=font_height))
         bbox = tp.get_extents()
         width = bbox.width
         height = bbox.height
+        # Center the text horizontally, consistent with preview
         x = snap((CANVAS_WIDTH - width) / 2)
+        # Position y to match the preview's y_start progression
         y = snap(y_start)
 
-        gcode.append(f"(Start label: {label})")
+        gcode.append(f"(Label: {label})")
+
         for poly in tp.to_polygons():
-            if not poly.any():
-                continue
-            poly = np.array(poly)
-            # Flip horizontally and vertically
-            poly[:, 0] = +poly[:, 0]
-            poly[:, 1] = +poly[:, 1]
+            poly = Polygon(poly)
+            # Flip Y-axis to match G-code (Y increases upward, origin at bottom-left)
+            poly = shapely.affinity.scale(poly, xfact=-1, yfact=-1, origin=(0, 0))
+            # Translate to the centered position
+            poly = shapely.affinity.translate(poly, xoff=x + width, yoff=y)
 
-            # Re-align to center
-            #poly[:, 0] += x + width / 2
-            poly[:, 0] += x + bbox.x0
-            poly[:, 1] += y - bbox.y0
+            if fill_text_var.get():
+                hatch_lines = hatch_fill(poly, spacing=cnc_settings["tool_diameter"] * 0.8)
+                for (sx, sy), (ex, ey) in hatch_lines:
+                    gcode.append(f"G0 X{sx:.3f} Y{sy:.3f}")
+                    gcode.append(f"G1 Z{-cnc_settings['text_cut_depth']:.3f} F{cnc_settings['feed_rate']}")
+                    gcode.append(f"G1 X{ex:.3f} Y{ey:.3f}")
+                    gcode.append(f"G0 Z{cnc_settings['safe_z']}")
+            else:
+                exterior_coords = np.array(poly.exterior.coords)
+                sx, sy = exterior_coords[0]
+                gcode.append(f"G0 X{sx:.3f} Y{sy:.3f}")
+                gcode.append(f"G1 Z{-cnc_settings['text_cut_depth']:.3f} F{cnc_settings['feed_rate']}")
+                for px, py in exterior_coords[1:]:
+                    gcode.append(f"G1 X{px:.3f} Y{py:.3f}")
+                gcode.append(f"G0 Z{cnc_settings['safe_z']}")
 
-            sx, sy = poly[0]
-            gcode.append(f"G0 X{sx:.3f} Y{sy:.3f}")
-            gcode.append(f"G1 Z{-cnc_settings['text_cut_depth']:.3f} F{cnc_settings['feed_rate']}")
-            for px, py in poly[1:]:
-                gcode.append(f"G1 X{px:.3f} Y{py:.3f}")
-            gcode.append(f"G0 Z{cnc_settings['safe_z']}")
+        # Cutout rectangle around the label
+        cutout_x_min = x - padding
+        cutout_y_min = y - height - padding
+        cutout_x_max = x + width + padding
+        cutout_y_max = y + padding
 
-        gcode.append("(Cutout box)")
+        gcode.append(f"(Cutout for label: {label})")
         gcode.append(f"G0 Z{cnc_settings['safe_z']}")
-        gcode.append(f"G0 X{x - padding:.3f} Y{y + height + padding:.3f}")
+
+        gcode.append(f"G0 X{cutout_x_min:.3f} Y{cutout_y_min:.3f}")
         gcode.append(f"G1 Z{-cnc_settings['label_cutout_depth']:.3f} F{cnc_settings['feed_rate']}")
-        gcode.append(f"G1 X{x + width + padding:.3f} Y{y + height + padding:.3f}")
-        gcode.append(f"G1 X{x + width + padding:.3f} Y{y - padding:.3f}")
-        gcode.append(f"G1 X{x - padding:.3f} Y{y - padding:.3f}")
-        gcode.append(f"G1 X{x - padding:.3f} Y{y + height + padding:.3f}")
+        gcode.append(f"G1 X{cutout_x_max:.3f} Y{cutout_y_min:.3f}")
+        gcode.append(f"G1 X{cutout_x_max:.3f} Y{cutout_y_max:.3f}")
+        gcode.append(f"G1 X{cutout_x_min:.3f} Y{cutout_y_max:.3f}")
+        gcode.append(f"G1 X{cutout_x_min:.3f} Y{cutout_y_min:.3f}")
         gcode.append(f"G0 Z{cnc_settings['safe_z']}")
 
+        # Increment y_start for the next label, consistent with preview
         y_start += height + spacing + padding * 2
-        if y_start > CANVAS_HEIGHT - 100:
-            gcode.append("(Warning: Labels exceed material height, stopping further labels)")
-            break
 
-    if cnc_settings["tool_mode"] == "Spindle":
-        gcode.append("M5 ; Stop spindle")
-    else:
-        gcode.append("M5 ; Turn off laser")
-    gcode.append("M2 ; End of program")
+    gcode.append("M5 ; stop spindle/laser")
+    gcode.append("M2 ; end program")
 
     file_path = filedialog.asksaveasfilename(defaultextension=".gcode", filetypes=[("G-code files", "*.gcode")])
     if file_path:
@@ -261,6 +321,8 @@ def toggle_snap():
 
 root = tk.Tk()
 root.title("CNC Label Maker")
+
+fill_text_var = tk.BooleanVar(value=False)
 
 Label(root, text="Labels (one per line):").grid(row=0, column=0, sticky="e")
 entry = tk.Text(root, height=4, width=50)
@@ -289,6 +351,8 @@ Button(root, text="💾 Export G-code", command=generate_gcode).grid(row=2, colu
 
 snap_var = tk.BooleanVar(value=False)
 Checkbutton(root, text="Snap to Grid", variable=snap_var, command=toggle_snap).grid(row=2, column=5)
+fill_text_var = tk.BooleanVar(value=False)
+Checkbutton(root, text="Fill Text", variable=fill_text_var, command=update_preview).grid(row=2, column=6)
 
 canvas = Canvas(root, width=cnc_settings["material_width"], height=cnc_settings["material_height"], bg="white")
 canvas.grid(row=3, column=0, columnspan=6, pady=10)
