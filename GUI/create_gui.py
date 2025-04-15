@@ -26,12 +26,11 @@ from shapely.geometry import Polygon, LineString
 from shapely.ops import unary_union, polygonize
 import shapely.affinity  
 
-
 SETTINGS_FILE = "machine_settings.json"
 
 cnc_settings = {
     "text_cut_depth": 0.2,
-    "label_cutout_depth": 0.8,
+    "label_cutout_depth": 1.6,
     "tool_diameter": 0.3,
     "safe_z": 5.0,
     "feed_rate": 300,
@@ -174,7 +173,6 @@ def update_preview():
             canvas.create_text(CANVAS_WIDTH / 2, y_start, text="Warning: Labels exceed material height", fill="orange")
             break
 
-
 def open_settings():
     win = Toplevel(root)
     win.title("Settings")
@@ -294,7 +292,6 @@ def generate_gcode():
         gcode.append(f"G1 X{cutout_x_min:.3f} Y{cutout_y_min:.3f}")
         gcode.append(f"G0 Z{cnc_settings['safe_z']}")
 
-        # Increment y_start for the next label, consistent with preview
         y_start += height + spacing + padding * 2
 
     gcode.append("M5 ; stop spindle/laser")
