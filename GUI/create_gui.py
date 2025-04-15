@@ -260,7 +260,7 @@ def toggle_snap():
     update_preview()
 
 root = tk.Tk()
-root.title("CNC Label Maker - Material Sheet Aware")
+root.title("CNC Label Maker")
 
 Label(root, text="Labels (one per line):").grid(row=0, column=0, sticky="e")
 entry = tk.Text(root, height=4, width=50)
