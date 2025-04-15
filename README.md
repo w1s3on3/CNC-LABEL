@@ -1,6 +1,6 @@
 # 🪪 CNC Label Maker
 
-The **CNC Label Maker** is a free, open-source tool that generates G-code for traffolyte-style labels using a custom stroke font. It supports both **console** and **GUI** versions, with live preview, customizable machine settings, and flexible grid layouts.
+The **CNC Label Maker** is a free, open-source tool that generates G-code for traffolyte-style labels using a custom stroke font. It supports both **console** and **GUI** versions, with live preview, customisable machine settings, and flexible grid layouts.
 
 ---
 
@@ -69,9 +69,6 @@ The GUI saves user preferences to `machine_settings.json`. You can edit this fil
 
 ---
 
-
----
-
 ## 🆕 GUI Version
 
 ### ✅ Usage Notes
@@ -98,11 +95,31 @@ python create_gui.py
 
 No font conversion required — just pick any installed font and go.
 
+---
+
+## ⚙️ Settings Explained
+
+When you click the **Settings** button in the GUI, you can configure and save your preferred cutting parameters:
+
+| Setting                | Description                                                                 |
+|------------------------|-----------------------------------------------------------------------------|
+| **Text Cut Depth**     | How deep the engraving for the text should go (e.g., 0.2mm)                 |
+| **Label Cutout Depth** | How deep to cut the full label shape around the text (e.g., 1.6mm)         |
+| **Tool Diameter**      | Diameter of your engraving tool (for preview clarity only)                  |
+| **Safe Z Height**      | The safe height (Z-axis) to lift to before rapid movement (e.g., 5.0mm)     |
+| **Feed Rate**          | Speed of cutting movement in mm/min (e.g., 300)                             |
+| **Tool Mode**          | Choose between **Spindle** (rotating tool) or **Laser** (for laser engravers) |
+| **Cutout Padding**     | Distance from text to label border in mm                                    |
+| **Material Width/Height** | Defines the preview canvas size (used for centering and overflow warning) |
+
+These settings are automatically saved to `machine_settings.json` for your next session.
+
+---
 
 ## 📦 Coming Soon
 
 - [ ] Multiline Support
-- [ ] Multi Font / Style Support
+- [ ] Style Support
 - [ ] SVG export
 - [ ] Barcode & QR code support
 - [ ] Font switching
