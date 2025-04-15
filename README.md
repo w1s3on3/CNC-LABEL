@@ -34,7 +34,9 @@ CNC-Label-Maker/
 ## 🖥️ Requirements
 
 - Python 3.8+
-- No dependencies required (uses only built-in modules)
+- matplotlib
+- numpy
+- shapely
 
 ---
 
