@@ -37,11 +37,7 @@ cnc_settings = {
 }
 
 def load_settings():
-    defaults = {
-        "text_cut_depth": 0.2, "label_cutout_depth": 1.6, "tool_diameter": 0.3,
-        "safe_z": 5.0, "feed_rate": 300, "tool_mode": "Spindle",
-        "cutout_padding": 2.0, "material_width": 1000, "material_height": 600
-    }
+    defaults = cnc_settings.copy()
     if os.path.exists(SETTINGS_FILE):
         with open(SETTINGS_FILE, "r") as f:
             loaded = json.load(f)
@@ -67,7 +63,7 @@ def get_system_fonts():
                 font_dict[name] = path
         except:
             pass
-    return font_dict
+    return dict(sorted(font_dict.items()))
 
 system_fonts = get_system_fonts()
 selected_font_path = [list(system_fonts.values())[0]]
@@ -96,12 +92,10 @@ def update_preview():
     zoom = zoom_scale[0]
 
     for label in labels:
-        # Get raw unscaled TextPath
         tp = TextPath((0, 0), label, prop=FontProperties(fname=font_path, size=font_height * zoom))
-
-        # Flip manually and apply offset
-        width = tp.get_extents().width
-        height = tp.get_extents().height
+        bbox = tp.get_extents()
+        width = bbox.width
+        height = bbox.height
         x = snap((CANVAS_WIDTH - width) / 2)
         y = snap(y_start)
 
@@ -115,7 +109,6 @@ def update_preview():
                 x2, y2 = poly[i + 1]
                 canvas.create_line(x1, y1, x2, y2, fill="red")
 
-        # Cutout box using flipped coordinates
         canvas.create_rectangle(
             x - padding, y - height - padding,
             x + width + padding, y + padding,
@@ -131,7 +124,6 @@ def update_preview():
             )
             break
 
-
 def open_settings():
     win = Toplevel(root)
     win.title("Settings")
@@ -144,18 +136,15 @@ def open_settings():
             cnc_settings["feed_rate"] = float(feed_rate.get())
             cnc_settings["tool_mode"] = tool_mode.get()
             cnc_settings["cutout_padding"] = float(cutout_padding.get())
-            width = float(material_width.get())
-            height = float(material_height.get())
-            if width <= 0 or height <= 0:
-                raise ValueError("Material dimensions must be positive")
-            cnc_settings["material_width"] = width
-            cnc_settings["material_height"] = height
+            cnc_settings["material_width"] = float(material_width.get())
+            cnc_settings["material_height"] = float(material_height.get())
         except ValueError as e:
             messagebox.showerror("Error", str(e))
             return
         save_settings()
         win.destroy()
         update_preview()
+
     Label(win, text="Text Cut Depth:").grid(row=0, column=0)
     text_cut_depth = Entry(win); text_cut_depth.insert(0, cnc_settings["text_cut_depth"]); text_cut_depth.grid(row=0, column=1)
     Label(win, text="Label Cutout Depth:").grid(row=1, column=0)
@@ -168,9 +157,9 @@ def open_settings():
     feed_rate = Entry(win); feed_rate.insert(0, cnc_settings["feed_rate"]); feed_rate.grid(row=4, column=1)
     Label(win, text="Cutout Padding:").grid(row=5, column=0)
     cutout_padding = Entry(win); cutout_padding.insert(0, cnc_settings["cutout_padding"]); cutout_padding.grid(row=5, column=1)
-    Label(win, text="Material Width (mm):").grid(row=6, column=0)
+    Label(win, text="Material Width:").grid(row=6, column=0)
     material_width = Entry(win); material_width.insert(0, cnc_settings["material_width"]); material_width.grid(row=6, column=1)
-    Label(win, text="Material Height (mm):").grid(row=7, column=0)
+    Label(win, text="Material Height:").grid(row=7, column=0)
     material_height = Entry(win); material_height.insert(0, cnc_settings["material_height"]); material_height.grid(row=7, column=1)
     Label(win, text="Tool Mode:").grid(row=8, column=0)
     tool_mode = StringVar(value=cnc_settings["tool_mode"])
@@ -197,7 +186,7 @@ def generate_gcode():
     gcode.append("G90 ; Absolute positioning")
     if cnc_settings["tool_mode"] == "Spindle":
         gcode.append("M3 S10000 ; Start spindle")
-    else:  # Laser
+    else:
         gcode.append("M3 S100 ; Set laser power")
     gcode.append(f"G0 Z{cnc_settings['safe_z']}")
 
@@ -213,21 +202,31 @@ def generate_gcode():
         for poly in tp.to_polygons():
             if not poly.any():
                 continue
+            poly = np.array(poly)
+            # Flip horizontally and vertically
+            poly[:, 0] = +poly[:, 0]
+            poly[:, 1] = +poly[:, 1]
+
+            # Re-align to center
+            #poly[:, 0] += x + width / 2
+            poly[:, 0] += x + bbox.x0
+            poly[:, 1] += y - bbox.y0
+
             sx, sy = poly[0]
-            gcode.append(f"G0 X{x + sx:.3f} Y{y - sy:.3f}")
+            gcode.append(f"G0 X{sx:.3f} Y{sy:.3f}")
             gcode.append(f"G1 Z{-cnc_settings['text_cut_depth']:.3f} F{cnc_settings['feed_rate']}")
             for px, py in poly[1:]:
-                gcode.append(f"G1 X{x + px:.3f} Y{y - py:.3f}")
+                gcode.append(f"G1 X{px:.3f} Y{py:.3f}")
             gcode.append(f"G0 Z{cnc_settings['safe_z']}")
 
         gcode.append("(Cutout box)")
         gcode.append(f"G0 Z{cnc_settings['safe_z']}")
-        gcode.append(f"G0 X{x - padding:.3f} Y{y - height - padding:.3f}")
+        gcode.append(f"G0 X{x - padding:.3f} Y{y + height + padding:.3f}")
         gcode.append(f"G1 Z{-cnc_settings['label_cutout_depth']:.3f} F{cnc_settings['feed_rate']}")
-        gcode.append(f"G1 X{x + width + padding:.3f} Y{y - height - padding:.3f}")
-        gcode.append(f"G1 X{x + width + padding:.3f} Y{y + padding:.3f}")
-        gcode.append(f"G1 X{x - padding:.3f} Y{y + padding:.3f}")
-        gcode.append(f"G1 X{x - padding:.3f} Y{y - height - padding:.3f}")
+        gcode.append(f"G1 X{x + width + padding:.3f} Y{y + height + padding:.3f}")
+        gcode.append(f"G1 X{x + width + padding:.3f} Y{y - padding:.3f}")
+        gcode.append(f"G1 X{x - padding:.3f} Y{y - padding:.3f}")
+        gcode.append(f"G1 X{x - padding:.3f} Y{y + height + padding:.3f}")
         gcode.append(f"G0 Z{cnc_settings['safe_z']}")
 
         y_start += height + spacing + padding * 2
@@ -248,14 +247,8 @@ def generate_gcode():
         messagebox.showinfo("Success", f"G-code saved to {file_path}")
 
 def zoom_canvas(event):
-    if isinstance(event, dict):
-        delta = event["delta"]
-    else:
-        delta = event.delta
-    if delta > 0:
-        zoom_scale[0] *= 1.1
-    else:
-        zoom_scale[0] /= 1.1
+    delta = event["delta"] if isinstance(event, dict) else event.delta
+    zoom_scale[0] *= 1.1 if delta > 0 else 0.9
     update_preview()
 
 def reset_zoom():
@@ -267,7 +260,7 @@ def toggle_snap():
     update_preview()
 
 root = tk.Tk()
-root.title("CNC Label Maker")
+root.title("CNC Label Maker - Material Sheet Aware")
 
 Label(root, text="Labels (one per line):").grid(row=0, column=0, sticky="e")
 entry = tk.Text(root, height=4, width=50)
