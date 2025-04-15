@@ -121,7 +121,7 @@ These settings are automatically saved to `machine_settings.json` for your next 
 ## 📦 Coming Soon
 
 - [ ] Multiline Support
-- [ ] Style Support
+- [ ] Style Support (Fix infil)
 - [ ] SVG export
 - [ ] Barcode & QR code support
 - [ ] Font switching
