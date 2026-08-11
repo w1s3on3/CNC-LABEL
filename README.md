@@ -8,13 +8,16 @@ The **CNC Label Maker** is a free, open-source tool that generates G-code for tr
 
 ```
 CNC-Label-Maker/
-├── console/                # Console-based G-code generator
+├── Console/                # Console-based G-code generator (stroke font)
 │   └── create.py
 ├── GUI/                    # GUI version with live preview and settings
-│   └── create_gui.py
-├── fonts/                  # Stroke font file (JSON) (CONSOLE VERSION)
+│   ├── create_gui.py
+│   └── machine_settings.json   # Auto-generated after running GUI
+├── fonts/                  # Stroke font files (JSON) (CONSOLE VERSION)
 │   └── normalized_full_font.json
-└── machine_settings.json   # Auto-generated after running GUI
+├── tests/                  # G-code generation tests
+│   └── test_gcode.py
+└── requirements.txt
 ```
 
 ---
@@ -34,9 +37,10 @@ CNC-Label-Maker/
 ## 🖥️ Requirements
 
 - Python 3.8+
-- matplotlib
-- numpy
-- shapely
+
+```bash
+pip install -r requirements.txt
+```
 
 ---
 
@@ -44,7 +48,7 @@ CNC-Label-Maker/
 
 ### 🔧 Console Version:
 ```bash
-cd console
+cd Console
 python create.py
 ```
 Follow the prompts to enter labels and generate individual `.gcode` files.
@@ -67,7 +71,12 @@ python create_gui.py
 Edit or expand `font/normalized_full_font.json` to add new characters or styles.
 
 **Settings**:  
-The GUI saves user preferences to `machine_settings.json`. You can edit this file directly or reset by deleting it.
+The GUI saves user preferences to `GUI/machine_settings.json`. You can edit this file directly or reset by deleting it.
+
+**Tests**:  
+```bash
+python -m unittest discover tests
+```
 
 ---
 
@@ -84,11 +93,11 @@ A modernized version using **TrueType fonts** for accurate rendering, cutouts, a
 
 ### ✨ Features
 - 🅰️ Uses system-installed TTF fonts (e.g., Arial, DIN)
-- ✂️ G-code generation for text + label cutouts
+- ✂️ G-code generation for text + label cutouts (multi-pass, with holding tabs)
+- 📏 Font height calibrated in real millimetres (capital letter height)
 - 🔍 Zoom with mouse scroll
 - 🔲 Grid snapping (toggle on/off)
-- 📤 SVG export with outlines and cut boxes
-- ⚙️ Settings panel for depths, spacing, tool mode (Spindle or Laser)
+- ⚙️ Settings panel for depths, feeds, tool mode (Spindle or Laser)
 
 ### ▶️ Run It
 ```bash
@@ -107,12 +116,17 @@ When you click the **Settings** button in the GUI, you can configure and save yo
 |------------------------|-----------------------------------------------------------------------------|
 | **Text Cut Depth**     | How deep the engraving for the text should go (e.g., 0.2mm)                 |
 | **Label Cutout Depth** | How deep to cut the full label shape around the text (e.g., 1.6mm)         |
-| **Tool Diameter**      | Diameter of your engraving tool (for preview clarity only)                  |
+| **Depth per Pass**     | Maximum depth removed per pass; deeper cuts are split into multiple passes  |
+| **Tool Diameter**      | Diameter of your engraving tool (sets hatch-fill line spacing)              |
 | **Safe Z Height**      | The safe height (Z-axis) to lift to before rapid movement (e.g., 5.0mm)     |
 | **Feed Rate**          | Speed of cutting movement in mm/min (e.g., 300)                             |
-| **Tool Mode**          | Choose between **Spindle** (rotating tool) or **Laser** (for laser engravers) |
+| **Plunge Rate**        | Speed of Z plunges in mm/min (e.g., 100)                                    |
+| **Spindle RPM**        | S value sent with M3 in Spindle mode                                        |
+| **Laser Power**        | S value sent with M4 in Laser mode (GRBL dynamic power)                     |
+| **Tool Mode**          | **Spindle** (M3, Z plunges) or **Laser** (M4 dynamic power, no Z motion)    |
 | **Cutout Padding**     | Distance from text to label border in mm                                    |
-| **Material Width/Height** | Defines the preview canvas size (used for centering and overflow warning) |
+| **Tab Width/Height**   | Holding tabs left on the cutout so labels don't come loose (0 = no tabs)    |
+| **Material Width/Height** | Material size in mm (used for centering, preview and overflow warning)  |
 
 These settings are automatically saved to `machine_settings.json` for your next session.
 
