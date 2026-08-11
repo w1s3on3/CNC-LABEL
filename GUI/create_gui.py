@@ -14,352 +14,541 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import os
 import json
+import math
+import os
 import tkinter as tk
-from tkinter import StringVar, OptionMenu, Label, Canvas, Entry, Toplevel, Button, Checkbutton, filedialog, messagebox
+from tkinter import (
+    StringVar, OptionMenu, Label, Canvas, Entry, Toplevel, Button,
+    Checkbutton, filedialog, messagebox,
+)
+
 from matplotlib.font_manager import FontProperties, findSystemFonts
 from matplotlib.textpath import TextPath
-from matplotlib.path import Path
 import numpy as np
-from shapely.geometry import Polygon, LineString
-from shapely.ops import unary_union, polygonize
-import shapely.affinity  
+from shapely.geometry import LineString, Polygon
+import shapely.affinity
 
-SETTINGS_FILE = "machine_settings.json"
+# Settings file lives next to this script, not in whatever directory the app
+# happens to be launched from.
+SETTINGS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "machine_settings.json"
+)
 
-cnc_settings = {
+DEFAULT_SETTINGS = {
     "text_cut_depth": 0.2,
     "label_cutout_depth": 1.6,
+    "pass_depth": 0.4,
     "tool_diameter": 0.3,
     "safe_z": 5.0,
     "feed_rate": 300,
+    "plunge_rate": 100,
+    "spindle_rpm": 10000,
+    "laser_power": 1000,
     "tool_mode": "Spindle",
     "cutout_padding": 2.0,
+    "tab_width": 3.0,
+    "tab_height": 0.4,
     "material_width": 1000,
-    "material_height": 600
+    "material_height": 600,
 }
 
+cnc_settings = DEFAULT_SETTINGS.copy()
+
+
 def load_settings():
-    defaults = cnc_settings.copy()
     if os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE, "r") as f:
-            loaded = json.load(f)
-            defaults.update(loaded)
-    cnc_settings.update(defaults)
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                cnc_settings.update(json.load(f))
+        except (ValueError, OSError):
+            pass  # corrupt/unreadable settings file: fall back to defaults
+
 
 def save_settings():
     with open(SETTINGS_FILE, "w") as f:
         json.dump(cnc_settings, f, indent=2)
 
-load_settings()
 
-zoom_scale = [1.0]
-grid_snapping = [False]
+# ---------------------------------------------------------------------------
+# Geometry — no GUI dependencies, shared by the preview and the G-code export
+# so the two can never drift apart.
+# ---------------------------------------------------------------------------
+
+# Fonts are rendered at a fixed size, then scaled so that capital letters come
+# out at the requested height in mm. (FontProperties size is a point size for
+# the em box — it is NOT the printed glyph height, so it can't be used as mm.)
+FONT_RENDER_SIZE = 100.0
+
+_cap_height_cache = {}
+
+
+def cap_height(font_path):
+    if font_path not in _cap_height_cache:
+        tp = TextPath((0, 0), "X", prop=FontProperties(fname=font_path, size=FONT_RENDER_SIZE))
+        h = tp.get_extents().height
+        _cap_height_cache[font_path] = h if h > 0 else FONT_RENDER_SIZE
+    return _cap_height_cache[font_path]
+
+
+def text_geometry(label, font_path, font_height_mm):
+    """Shapely geometry for a label with letter counters (the hole in O, A, e…)
+    as real holes, scaled so capitals are font_height_mm tall.
+
+    Origin is the bottom-left of the text bounding box, Y up (machine-style).
+    Returns None for labels with no printable outline.
+    """
+    tp = TextPath((0, 0), label, prop=FontProperties(fname=font_path, size=FONT_RENDER_SIZE))
+    geom = None
+    # TextPath returns every contour as a plain ring — outer shapes and holes
+    # alike. XOR-ing them together (even-odd rule) rebuilds the true glyph
+    # shapes with their holes.
+    for ring in tp.to_polygons():
+        if len(ring) < 3:
+            continue
+        p = Polygon(ring)
+        if not p.is_valid:
+            p = p.buffer(0)
+        if p.is_empty:
+            continue
+        geom = p if geom is None else geom.symmetric_difference(p)
+    if geom is None or geom.is_empty:
+        return None
+    scale = font_height_mm / cap_height(font_path)
+    geom = shapely.affinity.scale(geom, xfact=scale, yfact=scale, origin=(0, 0))
+    minx, miny, _, _ = geom.bounds
+    return shapely.affinity.translate(geom, xoff=-minx, yoff=-miny)
+
+
+def geom_polygons(geom):
+    """Iterate the Polygon parts of a Polygon/MultiPolygon/GeometryCollection."""
+    for part in getattr(geom, "geoms", [geom]):
+        if part.geom_type == "Polygon":
+            yield part
+        elif hasattr(part, "geoms"):
+            yield from geom_polygons(part)
+
+
+def geom_rings(geom):
+    """All rings (exteriors and holes) of a geometry, as coordinate arrays."""
+    for poly in geom_polygons(geom):
+        yield np.asarray(poly.exterior.coords)
+        for interior in poly.interiors:
+            yield np.asarray(interior.coords)
+
+
+def hatch_fill(geom, spacing):
+    """Horizontal fill lines clipped to the geometry (holes are skipped)."""
+    minx, miny, maxx, maxy = geom.bounds
+    lines = []
+    y = miny + spacing / 2
+    while y < maxy:
+        seg = geom.intersection(LineString([(minx - 1, y), (maxx + 1, y)]))
+        for g in getattr(seg, "geoms", [seg]):
+            if g.geom_type == "LineString" and g.length > 1e-9:
+                coords = list(g.coords)
+                lines.append((coords[0], coords[-1]))
+        y += spacing
+    return lines
+
+
+def build_layout(labels, font_path, font_height_mm, spacing, padding,
+                 material_width, snap_grid=None):
+    """Place labels top-down on the material, centered horizontally.
+
+    Coordinates are "canvas" mm: origin top-left, Y increases downward (what
+    the preview shows). Each item's geom keeps its own origin (text bbox
+    bottom-left, Y up); x/y_top place that box on the material.
+    """
+    def snap(v):
+        return round(v / snap_grid) * snap_grid if snap_grid else v
+
+    items = []
+    y_top = 40.0
+    for label in labels:
+        geom = text_geometry(label, font_path, font_height_mm)
+        if geom is None:
+            continue
+        _, _, width, height = geom.bounds
+        x = snap((material_width - width) / 2)
+        y_top = snap(y_top)
+        cutout = (x - padding, y_top - padding, x + width + padding, y_top + height + padding)
+        items.append({
+            "label": label, "geom": geom, "x": x, "y_top": y_top,
+            "width": width, "height": height, "cutout": cutout,
+        })
+        y_top += height + padding * 2 + spacing
+    return items
+
+
+# ---------------------------------------------------------------------------
+# G-code generation (pure: layout + settings in, lines out)
+# ---------------------------------------------------------------------------
+
+def pass_depths(total, step):
+    """Cutting depths for multi-pass work; the last pass lands exactly on total."""
+    step = max(abs(step), 0.01)
+    n = max(1, math.ceil(abs(total) / step))
+    return [min(abs(total), i * step) for i in range(1, n + 1)]
+
+
+def rect_segments_with_tabs(x0, y0, x1, y1, tab_width):
+    """The rectangle perimeter split into segments, leaving a gap (tab) at the
+    middle of each side."""
+    corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+    segments = []
+    for (ax, ay), (bx, by) in zip(corners, corners[1:]):
+        length = math.hypot(bx - ax, by - ay)
+        if length <= tab_width * 2:
+            segments.append([(ax, ay), (bx, by)])
+            continue
+        t0 = (length / 2 - tab_width / 2) / length
+        t1 = (length / 2 + tab_width / 2) / length
+        segments.append([(ax, ay), (ax + (bx - ax) * t0, ay + (by - ay) * t0)])
+        segments.append([(ax + (bx - ax) * t1, ay + (by - ay) * t1), (bx, by)])
+    return segments
+
+
+def generate_gcode_lines(layout, settings, fill_text):
+    """G-code for a layout produced by build_layout().
+
+    Canvas Y (down) is converted to machine Y (up) here, in one place:
+    machine_y = material_height - canvas_y. Nothing is mirrored — TextPath
+    geometry is already Y-up, same as the machine.
+    """
+    H = settings["material_height"]
+    laser = settings["tool_mode"] == "Laser"
+    feed = settings["feed_rate"]
+    plunge = settings["plunge_rate"]
+    safe_z = settings["safe_z"]
+
+    g = ["G21 ; units: mm", "G90 ; absolute positioning"]
+    if laser:
+        # GRBL dynamic laser mode: power only applies during G1 moves, so
+        # travels (G0) don't burn. No Z motion needed.
+        g.append(f"M4 S{settings['laser_power']:.0f} ; laser on (dynamic power)")
+    else:
+        g.append(f"G0 Z{safe_z:.3f}")
+        g.append(f"M3 S{settings['spindle_rpm']:.0f} ; spindle on")
+        g.append("G4 P2 ; wait for spindle to reach speed")
+
+    def polyline(points, depth):
+        sx, sy = points[0]
+        g.append(f"G0 X{sx:.3f} Y{sy:.3f}")
+        if not laser:
+            g.append(f"G1 Z{-depth:.3f} F{plunge:.0f}")
+        first = True
+        for px, py in points[1:]:
+            f_part = f" F{feed:.0f}" if first else ""
+            g.append(f"G1 X{px:.3f} Y{py:.3f}{f_part}")
+            first = False
+        if not laser:
+            g.append(f"G0 Z{safe_z:.3f}")
+
+    for item in layout:
+        x, y_top, height = item["x"], item["y_top"], item["height"]
+        # geom origin (text bbox bottom-left) in machine coordinates
+        geom = shapely.affinity.translate(
+            item["geom"], xoff=x, yoff=H - (y_top + height)
+        )
+
+        g.append(f"(Label: {item['label']})")
+        for depth in pass_depths(settings["text_cut_depth"], settings["pass_depth"]):
+            if fill_text:
+                for start, end in hatch_fill(geom, settings["tool_diameter"] * 0.8):
+                    polyline([start, end], depth)
+            else:
+                for ring in geom_rings(geom):
+                    polyline([tuple(pt) for pt in ring], depth)
+
+        # Cutout rectangle in machine coordinates
+        cx0, cy0, cx1, cy1 = item["cutout"]
+        mx0, my0, mx1, my1 = cx0, H - cy1, cx1, H - cy0
+        g.append(f"(Cutout for label: {item['label']})")
+        total = settings["label_cutout_depth"]
+        tab_h, tab_w = settings["tab_height"], settings["tab_width"]
+        for depth in pass_depths(total, settings["pass_depth"]):
+            # On the passes below tab height, leave gaps so the label stays
+            # attached until snapped out (spindle only — tabs don't apply to laser).
+            if not laser and tab_h > 0 and tab_w > 0 and depth > total - tab_h:
+                for seg in rect_segments_with_tabs(mx0, my0, mx1, my1, tab_w):
+                    polyline(seg, depth)
+            else:
+                polyline(
+                    [(mx0, my0), (mx1, my0), (mx1, my1), (mx0, my1), (mx0, my0)],
+                    depth,
+                )
+
+    g.append("M5 ; stop spindle/laser")
+    g.append("M2 ; end program")
+    return g
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
 
 def get_system_fonts():
-    fonts = findSystemFonts(fontpaths=None, fontext='ttf')
     font_dict = {}
-    for path in fonts:
+    for path in findSystemFonts(fontpaths=None, fontext="ttf"):
         try:
             name = FontProperties(fname=path).get_name()
-            if name not in font_dict:
-                font_dict[name] = path
-        except:
+            font_dict.setdefault(name, path)
+        except Exception:
             pass
     return dict(sorted(font_dict.items()))
 
-system_fonts = get_system_fonts()
-selected_font_path = [list(system_fonts.values())[0]]
 
-def snap(val, grid=5):
-    return round(val / grid) * grid if grid_snapping[0] else val
+SETTINGS_FIELDS = [
+    ("text_cut_depth", "Text Cut Depth (mm)"),
+    ("label_cutout_depth", "Label Cutout Depth (mm)"),
+    ("pass_depth", "Depth per Pass (mm)"),
+    ("tool_diameter", "Tool Diameter (mm)"),
+    ("safe_z", "Safe Z Height (mm)"),
+    ("feed_rate", "Feed Rate (mm/min)"),
+    ("plunge_rate", "Plunge Rate (mm/min)"),
+    ("spindle_rpm", "Spindle RPM"),
+    ("laser_power", "Laser Power (S value)"),
+    ("cutout_padding", "Cutout Padding (mm)"),
+    ("tab_width", "Tab Width (mm, 0 = no tabs)"),
+    ("tab_height", "Tab Height (mm, 0 = no tabs)"),
+    ("material_width", "Material Width (mm)"),
+    ("material_height", "Material Height (mm)"),
+]
 
-def hatch_fill(poly, spacing=0.3):
-    from shapely.geometry import LineString
-    bounds = poly.bounds
-    ymin, ymax = bounds[1], bounds[3]
-    hatch_lines = []
-    y = ymin - spacing
-    while y < ymax + spacing:
-        line = LineString([(bounds[0]-1, y), (bounds[2]+1, y)])
-        intersection = poly.intersection(line)
-        if intersection.is_empty:
-            y += spacing
-            continue
-        if intersection.geom_type == 'MultiLineString':
-            for geom in intersection.geoms:
-                x0, y0, x1, y1 = geom.bounds
-                hatch_lines.append(((x0, y0), (x1, y1)))
-        elif intersection.geom_type == 'LineString':
-            x0, y0, x1, y1 = intersection.bounds
-            hatch_lines.append(((x0, y0), (x1, y1)))
-        y += spacing
-    return hatch_lines
+SNAP_GRID_MM = 5
+MAX_CANVAS_W, MAX_CANVAS_H = 1200, 700
 
-def update_preview():
-    canvas.delete("all")
-    CANVAS_WIDTH = cnc_settings["material_width"]
-    CANVAS_HEIGHT = cnc_settings["material_height"]
-    canvas.config(width=CANVAS_WIDTH, height=CANVAS_HEIGHT)
 
-    font_path = selected_font_path[0]
-    text = entry.get("1.0", "end").strip()
-    try:
-        font_height = float(font_height_entry.get())
-        spacing = float(spacing_entry.get())
-    except ValueError:
-        canvas.create_text(CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2, text="Invalid font height or spacing", fill="red")
+def main():
+    load_settings()
+
+    system_fonts = get_system_fonts()
+    if not system_fonts:
+        messagebox.showerror(
+            "No fonts found",
+            "No TrueType fonts were found on this system. Install a TTF font and retry.",
+        )
         return
 
-    padding = cnc_settings["cutout_padding"]
-    labels = [lbl.strip().rstrip(",") for lbl in text.splitlines() if lbl.strip()]
-    y_start = 40
-    zoom = zoom_scale[0]
+    root = tk.Tk()
+    root.title("CNC Label Maker")
 
-    for label in labels:
-        tp = TextPath((0, 0), label, prop=FontProperties(fname=font_path, size=font_height * zoom))
-        bbox = tp.get_extents()
-        width, height = bbox.width, bbox.height
-        x = snap((CANVAS_WIDTH - width) / 2)
-        y = snap(y_start)
+    state = {
+        "zoom": 1.0,
+        "font_path": next(iter(system_fonts.values())),
+    }
 
-        # Convert TextPath to shapely polygons directly
-        polys = [Polygon(poly) for poly in tp.to_polygons()]
-        merged_poly = unary_union(polys).buffer(0)  # Correct geometry
+    def read_inputs():
+        """Widget values -> layout inputs, or None if a number field is invalid."""
+        try:
+            font_height = float(font_height_entry.get())
+            spacing = float(spacing_entry.get())
+        except ValueError:
+            return None
+        text = entry.get("1.0", "end").strip()
+        labels = [lbl.strip().rstrip(",") for lbl in text.splitlines() if lbl.strip()]
+        return labels, font_height, spacing
 
-        def draw_shapely_polygon(poly):
-            if poly.geom_type == 'Polygon':
-                exterior = np.array(poly.exterior.coords)
-                exterior[:, 1] *= -1
-                exterior[:, 0] += x
-                exterior[:, 1] += y
-                flat_exterior = [c for point in exterior for c in point]
-                canvas.create_polygon(flat_exterior, fill="black", outline="black")
-
-                for interior in poly.interiors:
-                    hole = np.array(interior.coords)
-                    hole[:, 1] *= -1
-                    hole[:, 0] += x
-                    hole[:, 1] += y
-                    flat_hole = [c for point in hole for c in point]
-                    canvas.create_polygon(flat_hole, fill="white", outline="white")
-
-            elif poly.geom_type == 'MultiPolygon':
-                for sub_poly in poly.geoms:
-                    draw_shapely_polygon(sub_poly)
-
-        if fill_text_var.get():
-            draw_shapely_polygon(merged_poly)
-        else:
-            for poly in polys:
-                poly_np = np.array(poly.exterior.coords)
-                poly_np[:, 1] *= -1
-                poly_np[:, 0] += x
-                poly_np[:, 1] += y
-                for i in range(len(poly_np) - 1):
-                    x1, y1 = poly_np[i]
-                    x2, y2 = poly_np[i + 1]
-                    canvas.create_line(x1, y1, x2, y2, fill="red")
-
-        canvas.create_rectangle(
-            x - padding, y - height - padding,
-            x + width + padding, y + padding,
-            outline="blue", dash=(2, 2)
+    def current_layout():
+        inputs = read_inputs()
+        if inputs is None:
+            return None
+        labels, font_height, spacing = inputs
+        return build_layout(
+            labels, state["font_path"], font_height, spacing,
+            cnc_settings["cutout_padding"], cnc_settings["material_width"],
+            snap_grid=SNAP_GRID_MM if snap_var.get() else None,
         )
 
-        y_start += height + spacing + padding * 2
-        if y_start > CANVAS_HEIGHT - 100:
-            canvas.create_text(CANVAS_WIDTH / 2, y_start, text="Warning: Labels exceed material height", fill="orange")
-            break
+    def update_preview():
+        canvas.delete("all")
+        zoom = state["zoom"]
+        mat_w, mat_h = cnc_settings["material_width"], cnc_settings["material_height"]
+        canvas.config(width=min(mat_w, MAX_CANVAS_W), height=min(mat_h, MAX_CANVAS_H))
 
-def open_settings():
-    win = Toplevel(root)
-    win.title("Settings")
-    def save():
-        try:
-            cnc_settings["text_cut_depth"] = float(text_cut_depth.get())
-            cnc_settings["label_cutout_depth"] = float(label_cutout_depth.get())
-            cnc_settings["tool_diameter"] = float(tool_diameter.get())
-            cnc_settings["safe_z"] = float(safe_z.get())
-            cnc_settings["feed_rate"] = float(feed_rate.get())
-            cnc_settings["tool_mode"] = tool_mode.get()
-            cnc_settings["cutout_padding"] = float(cutout_padding.get())
-            cnc_settings["material_width"] = float(material_width.get())
-            cnc_settings["material_height"] = float(material_height.get())
-        except ValueError as e:
-            messagebox.showerror("Error", str(e))
+        if read_inputs() is None:
+            canvas.create_text(
+                200, 40, text="Invalid font height or spacing", fill="red"
+            )
             return
-        save_settings()
-        win.destroy()
-        update_preview()
+        layout = current_layout()
 
-    Label(win, text="Text Cut Depth:").grid(row=0, column=0)
-    text_cut_depth = Entry(win); text_cut_depth.insert(0, cnc_settings["text_cut_depth"]); text_cut_depth.grid(row=0, column=1)
-    Label(win, text="Label Cutout Depth:").grid(row=1, column=0)
-    label_cutout_depth = Entry(win); label_cutout_depth.insert(0, cnc_settings["label_cutout_depth"]); label_cutout_depth.grid(row=1, column=1)
-    Label(win, text="Tool Diameter:").grid(row=2, column=0)
-    tool_diameter = Entry(win); tool_diameter.insert(0, cnc_settings["tool_diameter"]); tool_diameter.grid(row=2, column=1)
-    Label(win, text="Safe Z Height:").grid(row=3, column=0)
-    safe_z = Entry(win); safe_z.insert(0, cnc_settings["safe_z"]); safe_z.grid(row=3, column=1)
-    Label(win, text="Feed Rate:").grid(row=4, column=0)
-    feed_rate = Entry(win); feed_rate.insert(0, cnc_settings["feed_rate"]); feed_rate.grid(row=4, column=1)
-    Label(win, text="Cutout Padding:").grid(row=5, column=0)
-    cutout_padding = Entry(win); cutout_padding.insert(0, cnc_settings["cutout_padding"]); cutout_padding.grid(row=5, column=1)
-    Label(win, text="Material Width:").grid(row=6, column=0)
-    material_width = Entry(win); material_width.insert(0, cnc_settings["material_width"]); material_width.grid(row=6, column=1)
-    Label(win, text="Material Height:").grid(row=7, column=0)
-    material_height = Entry(win); material_height.insert(0, cnc_settings["material_height"]); material_height.grid(row=7, column=1)
-    Label(win, text="Tool Mode:").grid(row=8, column=0)
-    tool_mode = StringVar(value=cnc_settings["tool_mode"])
-    OptionMenu(win, tool_mode, "Spindle", "Laser").grid(row=8, column=1)
-    Button(win, text="Save", command=save).grid(row=9, column=0, columnspan=2, pady=10)
+        # Material boundary
+        canvas.create_rectangle(0, 0, mat_w * zoom, mat_h * zoom, outline="gray")
 
-def generate_gcode():
-    CANVAS_WIDTH = cnc_settings["material_width"]
-    CANVAS_HEIGHT = cnc_settings["material_height"]
-    font_path = selected_font_path[0]
-    text = entry.get("1.0", "end").strip()
-    try:
-        font_height = float(font_height_entry.get())
-        spacing = float(spacing_entry.get())
-    except ValueError:
-        messagebox.showerror("Error", "Invalid font height or spacing")
-        return
-    padding = cnc_settings["cutout_padding"]
-    labels = [lbl.strip().rstrip(",") for lbl in text.splitlines() if lbl.strip()]
-    gcode = []
-    y_start = 40  # Start 40mm from the top, consistent with preview
+        overflow = False
+        for item in layout:
+            x, y_top, height = item["x"], item["y_top"], item["height"]
 
-    gcode.append("G21 ; mm mode")
-    gcode.append("G90 ; absolute positioning")
-    gcode.append(f"G0 Z{cnc_settings['safe_z']}")
-
-    if cnc_settings["tool_mode"] == "Spindle":
-        gcode.append("M3 S10000 ; spindle on")
-    else:
-        gcode.append("M3 S100 ; laser on")
-
-    for label in labels:
-        tp = TextPath((0, 0), label, prop=FontProperties(fname=font_path, size=font_height))
-        bbox = tp.get_extents()
-        width = bbox.width
-        height = bbox.height
-        # Center the text horizontally, consistent with preview
-        x = snap((CANVAS_WIDTH - width) / 2)
-        # Position y to match the preview's y_start progression
-        y = snap(y_start)
-
-        gcode.append(f"(Label: {label})")
-
-        for poly in tp.to_polygons():
-            poly = Polygon(poly)
-            # Flip Y-axis to match G-code (Y increases upward, origin at bottom-left)
-            poly = shapely.affinity.scale(poly, xfact=-1, yfact=-1, origin=(0, 0))
-            # Translate to the centered position
-            poly = shapely.affinity.translate(poly, xoff=x + width, yoff=y)
+            # geom is Y-up with origin at the text bbox bottom-left; the canvas
+            # is Y-down, so: canvas_y = y_top + height - geom_y
+            def to_canvas(coords):
+                pts = np.asarray(coords, dtype=float).copy()
+                pts[:, 0] = (pts[:, 0] + x) * zoom
+                pts[:, 1] = (y_top + height - pts[:, 1]) * zoom
+                return pts
 
             if fill_text_var.get():
-                hatch_lines = hatch_fill(poly, spacing=cnc_settings["tool_diameter"] * 0.8)
-                for (sx, sy), (ex, ey) in hatch_lines:
-                    gcode.append(f"G0 X{sx:.3f} Y{sy:.3f}")
-                    gcode.append(f"G1 Z{-cnc_settings['text_cut_depth']:.3f} F{cnc_settings['feed_rate']}")
-                    gcode.append(f"G1 X{ex:.3f} Y{ey:.3f}")
-                    gcode.append(f"G0 Z{cnc_settings['safe_z']}")
+                for poly in geom_polygons(item["geom"]):
+                    ext = to_canvas(poly.exterior.coords)
+                    canvas.create_polygon(
+                        [c for pt in ext for c in pt], fill="black", outline="black"
+                    )
+                    for interior in poly.interiors:
+                        hole = to_canvas(interior.coords)
+                        canvas.create_polygon(
+                            [c for pt in hole for c in pt], fill="white", outline="white"
+                        )
             else:
-                exterior_coords = np.array(poly.exterior.coords)
-                sx, sy = exterior_coords[0]
-                gcode.append(f"G0 X{sx:.3f} Y{sy:.3f}")
-                gcode.append(f"G1 Z{-cnc_settings['text_cut_depth']:.3f} F{cnc_settings['feed_rate']}")
-                for px, py in exterior_coords[1:]:
-                    gcode.append(f"G1 X{px:.3f} Y{py:.3f}")
-                gcode.append(f"G0 Z{cnc_settings['safe_z']}")
+                for ring in geom_rings(item["geom"]):
+                    pts = to_canvas(ring)
+                    for i in range(len(pts) - 1):
+                        canvas.create_line(*pts[i], *pts[i + 1], fill="red")
 
-        # Cutout rectangle around the label
-        cutout_x_min = x - padding
-        cutout_y_min = y - height - padding
-        cutout_x_max = x + width + padding
-        cutout_y_max = y + padding
+            cx0, cy0, cx1, cy1 = item["cutout"]
+            canvas.create_rectangle(
+                cx0 * zoom, cy0 * zoom, cx1 * zoom, cy1 * zoom,
+                outline="blue", dash=(2, 2),
+            )
+            if cy1 > mat_h or cx0 < 0:
+                overflow = True
 
-        gcode.append(f"(Cutout for label: {label})")
-        gcode.append(f"G0 Z{cnc_settings['safe_z']}")
+        if overflow:
+            canvas.create_text(
+                min(mat_w, MAX_CANVAS_W) / 2, 20,
+                text="Warning: labels exceed material size", fill="orange",
+            )
 
-        gcode.append(f"G0 X{cutout_x_min:.3f} Y{cutout_y_min:.3f}")
-        gcode.append(f"G1 Z{-cnc_settings['label_cutout_depth']:.3f} F{cnc_settings['feed_rate']}")
-        gcode.append(f"G1 X{cutout_x_max:.3f} Y{cutout_y_min:.3f}")
-        gcode.append(f"G1 X{cutout_x_max:.3f} Y{cutout_y_max:.3f}")
-        gcode.append(f"G1 X{cutout_x_min:.3f} Y{cutout_y_max:.3f}")
-        gcode.append(f"G1 X{cutout_x_min:.3f} Y{cutout_y_min:.3f}")
-        gcode.append(f"G0 Z{cnc_settings['safe_z']}")
+    def generate_gcode():
+        if read_inputs() is None:
+            messagebox.showerror("Error", "Invalid font height or spacing")
+            return
+        layout = current_layout()
+        if not layout:
+            messagebox.showerror("Error", "Nothing to export — enter at least one label")
+            return
+        for item in layout:
+            cx0, cy0, cx1, cy1 = item["cutout"]
+            if cy1 > cnc_settings["material_height"] or cx0 < 0:
+                if not messagebox.askyesno(
+                    "Overflow",
+                    "Labels exceed the material size. Export anyway?",
+                ):
+                    return
+                break
 
-        y_start += height + spacing + padding * 2
+        gcode = generate_gcode_lines(layout, cnc_settings, fill_text_var.get())
 
-    gcode.append("M5 ; stop spindle/laser")
-    gcode.append("M2 ; end program")
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".gcode", filetypes=[("G-code files", "*.gcode")]
+        )
+        if file_path:
+            with open(file_path, "w") as f:
+                f.write("\n".join(gcode))
+            messagebox.showinfo("Success", f"G-code saved to {file_path}")
 
-    file_path = filedialog.asksaveasfilename(defaultextension=".gcode", filetypes=[("G-code files", "*.gcode")])
-    if file_path:
-        with open(file_path, "w") as f:
-            f.write("\n".join(gcode))
-        messagebox.showinfo("Success", f"G-code saved to {file_path}")
+    def open_settings():
+        win = Toplevel(root)
+        win.title("Settings")
+        entries = {}
+        for row, (key, text) in enumerate(SETTINGS_FIELDS):
+            Label(win, text=text + ":").grid(row=row, column=0, sticky="e")
+            e = Entry(win)
+            e.insert(0, cnc_settings[key])
+            e.grid(row=row, column=1)
+            entries[key] = e
+        Label(win, text="Tool Mode:").grid(row=len(SETTINGS_FIELDS), column=0, sticky="e")
+        tool_mode = StringVar(value=cnc_settings["tool_mode"])
+        OptionMenu(win, tool_mode, "Spindle", "Laser").grid(
+            row=len(SETTINGS_FIELDS), column=1
+        )
 
-def zoom_canvas(event):
-    delta = event["delta"] if isinstance(event, dict) else event.delta
-    zoom_scale[0] *= 1.1 if delta > 0 else 0.9
+        def save():
+            try:
+                new_values = {k: float(e.get()) for k, e in entries.items()}
+            except ValueError:
+                messagebox.showerror("Error", "All settings must be numbers")
+                return
+            for key in ("pass_depth", "safe_z", "feed_rate", "plunge_rate"):
+                if new_values[key] <= 0:
+                    messagebox.showerror("Error", f"{key} must be greater than zero")
+                    return
+            cnc_settings.update(new_values)
+            cnc_settings["tool_mode"] = tool_mode.get()
+            save_settings()
+            win.destroy()
+            update_preview()
+
+        Button(win, text="Save", command=save).grid(
+            row=len(SETTINGS_FIELDS) + 1, column=0, columnspan=2, pady=10
+        )
+
+    def zoom_canvas(delta):
+        state["zoom"] *= 1.1 if delta > 0 else 0.9
+        update_preview()
+
+    def reset_zoom():
+        state["zoom"] = 1.0
+        update_preview()
+
+    def select_font(name):
+        state["font_path"] = system_fonts[name]
+        update_preview()
+
+    # --- widgets ---
+    Label(root, text="Labels (one per line):").grid(row=0, column=0, sticky="e")
+    entry = tk.Text(root, height=4, width=50)
+    entry.grid(row=0, column=1, columnspan=4, sticky="w")
+
+    Label(root, text="Font Height (mm):").grid(row=1, column=0, sticky="e")
+    font_height_entry = Entry(root, width=5)
+    font_height_entry.insert(0, "10")
+    font_height_entry.grid(row=1, column=1, sticky="w")
+
+    Label(root, text="Label Spacing (mm):").grid(row=1, column=2, sticky="e")
+    spacing_entry = Entry(root, width=5)
+    spacing_entry.insert(0, "10")
+    spacing_entry.grid(row=1, column=3, sticky="w")
+
+    Label(root, text="Font:").grid(row=2, column=0, sticky="e")
+    font_name = StringVar()
+    font_name.set(next(iter(system_fonts.keys())))
+    OptionMenu(root, font_name, *system_fonts.keys(), command=select_font).grid(
+        row=2, column=1, sticky="w"
+    )
+
+    Button(root, text="⚙ Settings", command=open_settings).grid(row=2, column=2)
+    Button(root, text="🔄 Reset Zoom", command=reset_zoom).grid(row=2, column=3)
+    Button(root, text="💾 Export G-code", command=generate_gcode).grid(row=2, column=4)
+
+    snap_var = tk.BooleanVar(value=False)
+    Checkbutton(root, text="Snap to Grid", variable=snap_var, command=update_preview).grid(
+        row=2, column=5
+    )
+    fill_text_var = tk.BooleanVar(value=False)
+    Checkbutton(root, text="Fill Text", variable=fill_text_var, command=update_preview).grid(
+        row=2, column=6
+    )
+
+    canvas = Canvas(
+        root,
+        width=min(cnc_settings["material_width"], MAX_CANVAS_W),
+        height=min(cnc_settings["material_height"], MAX_CANVAS_H),
+        bg="white",
+    )
+    canvas.grid(row=3, column=0, columnspan=7, pady=10)
+
+    canvas.bind("<MouseWheel>", lambda e: zoom_canvas(e.delta))
+    canvas.bind("<Button-4>", lambda e: zoom_canvas(120))
+    canvas.bind("<Button-5>", lambda e: zoom_canvas(-120))
+    entry.bind("<KeyRelease>", lambda e: update_preview())
+    font_height_entry.bind("<KeyRelease>", lambda e: update_preview())
+    spacing_entry.bind("<KeyRelease>", lambda e: update_preview())
+
     update_preview()
+    root.mainloop()
 
-def reset_zoom():
-    zoom_scale[0] = 1.0
-    update_preview()
 
-def toggle_snap():
-    grid_snapping[0] = snap_var.get()
-    update_preview()
-
-root = tk.Tk()
-root.title("CNC Label Maker")
-
-fill_text_var = tk.BooleanVar(value=False)
-
-Label(root, text="Labels (one per line):").grid(row=0, column=0, sticky="e")
-entry = tk.Text(root, height=4, width=50)
-entry.grid(row=0, column=1, columnspan=4, sticky="w")
-
-Label(root, text="Font Height (mm):").grid(row=1, column=0, sticky="e")
-font_height_entry = Entry(root, width=5)
-font_height_entry.insert(0, "10")
-font_height_entry.grid(row=1, column=1, sticky="w")
-
-Label(root, text="Label Spacing (mm):").grid(row=1, column=2, sticky="e")
-spacing_entry = Entry(root, width=5)
-spacing_entry.insert(0, "10")
-spacing_entry.grid(row=1, column=3, sticky="w")
-
-Label(root, text="Font:").grid(row=2, column=0, sticky="e")
-font_name = StringVar()
-font_name.set(list(system_fonts.keys())[0])
-font_dropdown = OptionMenu(root, font_name, *system_fonts.keys(),
-                          command=lambda name: selected_font_path.__setitem__(0, system_fonts[name]) or update_preview())
-font_dropdown.grid(row=2, column=1, sticky="w")
-
-Button(root, text="⚙ Settings", command=open_settings).grid(row=2, column=2)
-Button(root, text="🔄 Reset Zoom", command=reset_zoom).grid(row=2, column=3)
-Button(root, text="💾 Export G-code", command=generate_gcode).grid(row=2, column=4)
-
-snap_var = tk.BooleanVar(value=False)
-Checkbutton(root, text="Snap to Grid", variable=snap_var, command=toggle_snap).grid(row=2, column=5)
-fill_text_var = tk.BooleanVar(value=False)
-Checkbutton(root, text="Fill Text", variable=fill_text_var, command=update_preview).grid(row=2, column=6)
-
-canvas = Canvas(root, width=cnc_settings["material_width"], height=cnc_settings["material_height"], bg="white")
-canvas.grid(row=3, column=0, columnspan=6, pady=10)
-
-canvas.bind("<MouseWheel>", zoom_canvas)
-canvas.bind("<Button-4>", lambda e: zoom_canvas({"delta": 120}))
-canvas.bind("<Button-5>", lambda e: zoom_canvas({"delta": -120}))
-entry.bind("<KeyRelease>", lambda e: update_preview())
-font_height_entry.bind("<KeyRelease>", lambda e: update_preview())
-spacing_entry.bind("<KeyRelease>", lambda e: update_preview())
-
-update_preview()
-root.mainloop()
+if __name__ == "__main__":
+    main()
