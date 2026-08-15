@@ -101,6 +101,8 @@ A modernized version using **TrueType fonts** for accurate rendering, cutouts, a
 - 🔧 Kerf compensation — toolpath offset by tool radius (spindle) or half kerf (laser), so finished labels match the drawn size
 - 🔍 Zoom with mouse scroll
 - 🔲 Grid snapping (toggle on/off)
+- 🛰️ Toolpath view — simulates the actual exported G-code: rapids (grey dashes), engraving (red), cutout passes (blue, tab gaps visible) and cut order badges
+- 🧭 Dry Run export — trace the job boundary at Safe Z with the spindle off, or at low Frame Power on a laser, to verify placement before cutting
 - ⚙️ Settings panel for depths, feeds, tool mode (Spindle or Laser)
 
 ### ▶️ Run It
@@ -159,9 +161,9 @@ These settings are automatically saved to `machine_settings.json` for your next 
 ## 📦 Coming Soon
 
 - [ ] Multiline text within one label
+- [x] Dry run / frame mode (trace the job boundary at Safe Z or low power)
+- [x] Toolpath preview (rapids, cut order, tabs)
 - [ ] Grid/sheet nesting in the GUI (rows × columns across the stock)
-- [ ] Dry run / frame mode (trace the job boundary at Safe Z or low power)
-- [ ] Toolpath preview (rapids, cut order, tabs)
 - [ ] Rounded corners & mounting holes
 - [ ] SVG export
 - [ ] Barcode & QR code support

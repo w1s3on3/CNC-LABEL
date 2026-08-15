@@ -17,6 +17,7 @@
 import json
 import math
 import os
+import re
 import tkinter as tk
 from tkinter import (
     StringVar, OptionMenu, Label, Canvas, Entry, Toplevel, Button,
@@ -47,6 +48,7 @@ DEFAULT_SETTINGS = {
     "plunge_rate": 100,
     "spindle_rpm": 10000,
     "laser_power": 1000,
+    "frame_power": 5.0,
     "tool_mode": "Spindle",
     "cutout_padding": 2.0,
     "laser_kerf": 0.15,
@@ -324,6 +326,81 @@ def generate_gcode_lines(layout, settings, fill_text):
     return g
 
 
+def _gword(line, letter, default):
+    m = re.search(rf"{letter}(-?\d+\.?\d*)", line)
+    return float(m.group(1)) if m else default
+
+
+def simulate_gcode(lines):
+    """Replay generated G-code into XY segments for the toolpath preview.
+
+    Returns a list of (x0, y0, x1, y1, kind, z) in machine coordinates, where
+    kind is 'rapid', 'engrave' or 'cutout' (from the block comments the
+    generator emits) and z is the modal Z of the move (0 in laser mode).
+    Simulating the real G-code means the preview shows exactly what the
+    machine will receive — including passes, tabs and kerf offsets.
+    """
+    segments = []
+    x = y = z = 0.0
+    kind = "engrave"
+    for line in lines:
+        if line.startswith("(Label:"):
+            kind = "engrave"
+            continue
+        if line.startswith("(Cutout"):
+            kind = "cutout"
+            continue
+        m = re.match(r"G([01])\b", line)
+        if not m:
+            continue
+        nx, ny, nz = _gword(line, "X", x), _gword(line, "Y", y), _gword(line, "Z", z)
+        if nx != x or ny != y:
+            segments.append(
+                (x, y, nx, ny, "rapid" if m.group(1) == "0" else kind, nz)
+            )
+        x, y, z = nx, ny, nz
+    return segments
+
+
+def generate_dry_run_lines(layout, settings):
+    """Trace the job's outer boundary without cutting anything.
+
+    Spindle mode: moves at Safe Z with the spindle off, so you can watch the
+    machine trace the job outline and check placement/clamp clearance.
+    Laser mode: traces at Frame Power (a very low S value) with no Z motion,
+    so the spot is visible while framing.
+    """
+    if not layout:
+        return []
+    H = settings["material_height"]
+    laser = settings["tool_mode"] == "Laser"
+    r = (settings["laser_kerf"] if laser else settings["tool_diameter"]) / 2
+    ox, oy = settings["offset_x"], settings["offset_y"]
+
+    # Outer bounds of all cutout toolpaths (kerf offset included), machine coords
+    x0 = min(i["cutout"][0] for i in layout) - r + ox
+    x1 = max(i["cutout"][2] for i in layout) + r + ox
+    y0 = H - max(i["cutout"][3] for i in layout) - r + oy
+    y1 = H - min(i["cutout"][1] for i in layout) + r + oy
+
+    g = [
+        "G21 ; units: mm",
+        "G90 ; absolute positioning",
+        "(Dry run: job boundary trace only - no cutting)",
+    ]
+    if laser:
+        g.append(f"M4 S{settings['frame_power']:.0f} ; laser at frame power")
+    else:
+        g.append("M5 ; spindle off")
+        g.append(f"G0 Z{settings['safe_z']:.3f} ; stay at safe height")
+    g.append(f"G0 X{x0:.3f} Y{y0:.3f}")
+    for px, py in [(x1, y0), (x1, y1), (x0, y1), (x0, y0)]:
+        g.append(f"G1 X{px:.3f} Y{py:.3f} F{settings['feed_rate']:.0f}")
+    g.append("M5")
+    g.append("M2 ; end program")
+    return g
+
+
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
@@ -351,6 +428,7 @@ SETTINGS_FIELDS = [
     ("plunge_rate", "Plunge Rate (mm/min)"),
     ("spindle_rpm", "Spindle RPM"),
     ("laser_power", "Laser Power (S value)"),
+    ("frame_power", "Frame Power (S value, laser dry run)"),
     ("cutout_padding", "Cutout Padding (mm)"),
     ("laser_kerf", "Laser Kerf (mm)"),
     ("tab_width", "Tab Width (mm, 0 = no tabs)"),
@@ -453,8 +531,54 @@ def main():
         origin_label = "X0 Y0" if not (ox or oy) else f"job at X{ox:g} Y{oy:g}"
         canvas.create_text(zx + 6, zy + 12, text=origin_label, fill="green", anchor="w")
 
-        overflow = False
-        for item in layout:
+        overflow = any(
+            item["cutout"][2] > mat_w or item["cutout"][1] < 0 for item in layout
+        )
+
+        if toolpath_var.get():
+            # Simulate the real exported G-code so the preview cannot lie
+            segs = simulate_gcode(
+                generate_gcode_lines(layout, cnc_settings, fill_text_var.get())
+            )
+            job_ox, job_oy = cnc_settings["offset_x"], cnc_settings["offset_y"]
+            final_z = min((s[5] for s in segs if s[4] == "cutout"), default=0.0)
+            order = {"rapid": 0, "engrave": 1, "cutout": 2}
+
+            def draw_rank(seg):
+                kind, z = seg[4], seg[5]
+                is_final = kind == "cutout" and abs(z - final_z) < 1e-6
+                return (order[kind], 1 if is_final else 0)
+
+            # Earlier cutout passes draw first (light blue) so tab gaps in the
+            # final (dark) pass show through where the tabs are
+            for x0m, y0m, x1m, y1m, kind, z in sorted(segs, key=draw_rank):
+                p = (sx(x0m - job_ox), sy(mat_h - (y0m - job_oy)),
+                     sx(x1m - job_ox), sy(mat_h - (y1m - job_oy)))
+                if kind == "rapid":
+                    canvas.create_line(*p, fill="#bbbbbb", dash=(2, 3))
+                elif kind == "engrave":
+                    canvas.create_line(*p, fill="red")
+                elif abs(z - final_z) < 1e-6:
+                    canvas.create_line(*p, fill="#0000cc", width=2)
+                else:
+                    canvas.create_line(*p, fill="#aac6e8")
+
+            # Cut order badges (labels are engraved then cut out, in this order)
+            for i, item in enumerate(layout, 1):
+                px, py = sx(item["cutout"][0]), sy(item["cutout"][1])
+                canvas.create_oval(px - 9, py - 9, px + 9, py + 9,
+                                   fill="white", outline="green")
+                canvas.create_text(px, py, text=str(i), fill="green")
+            canvas.create_text(
+                CANVAS_W / 2, CANVAS_H - 10, fill="gray",
+                text=("grey dashes = rapids · red = engraving · dark blue = final cutout pass "
+                      "(gaps = tabs) · light blue = earlier passes · numbers = cut order"),
+            )
+            design_items = []  # design drawing below is skipped in toolpath view
+        else:
+            design_items = layout
+
+        for item in design_items:
             x, y_top, height = item["x"], item["y_top"], item["height"]
 
             # geom is Y-up with origin at the text bbox bottom-left; the canvas
@@ -489,8 +613,6 @@ def main():
                 sx(cx0), sy(cy0), sx(cx1), sy(cy1),
                 outline="blue" if item["fits"] else "red", dash=(2, 2),
             )
-            if cx1 > mat_w or cy0 < 0:
-                overflow = True
 
         warnings = []
         if overflow:
@@ -533,6 +655,24 @@ def main():
             with open(file_path, "w") as f:
                 f.write("\n".join(gcode))
             messagebox.showinfo("Success", f"G-code saved to {file_path}")
+
+    def export_dry_run():
+        if read_inputs() is None:
+            messagebox.showerror("Error", "Invalid font height, spacing or label size")
+            return
+        layout = current_layout()
+        if not layout:
+            messagebox.showerror("Error", "Nothing to trace — enter at least one label")
+            return
+        gcode = generate_dry_run_lines(layout, cnc_settings)
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".gcode", initialfile="dry_run.gcode",
+            filetypes=[("G-code files", "*.gcode")],
+        )
+        if file_path:
+            with open(file_path, "w") as f:
+                f.write("\n".join(gcode))
+            messagebox.showinfo("Success", f"Dry-run G-code saved to {file_path}")
 
     def open_settings():
         win = Toplevel(root)
@@ -641,18 +781,23 @@ def main():
     Button(root, text="⚙ Settings", command=open_settings).grid(row=2, column=2)
     Button(root, text="🔄 Reset Zoom", command=reset_zoom).grid(row=2, column=3)
     Button(root, text="💾 Export G-code", command=generate_gcode).grid(row=2, column=4)
+    Button(root, text="🧭 Dry Run", command=export_dry_run).grid(row=2, column=5)
 
     snap_var = tk.BooleanVar(value=False)
     Checkbutton(root, text="Snap to Grid", variable=snap_var, command=update_preview).grid(
-        row=2, column=5
+        row=2, column=6
     )
     fill_text_var = tk.BooleanVar(value=False)
     Checkbutton(root, text="Fill Text", variable=fill_text_var, command=update_preview).grid(
-        row=2, column=6
+        row=2, column=7
+    )
+    toolpath_var = tk.BooleanVar(value=False)
+    Checkbutton(root, text="Toolpath", variable=toolpath_var, command=update_preview).grid(
+        row=2, column=8
     )
 
     canvas = Canvas(root, width=CANVAS_W, height=CANVAS_H, bg="white")
-    canvas.grid(row=3, column=0, columnspan=7, pady=10)
+    canvas.grid(row=3, column=0, columnspan=9, pady=10)
 
     canvas.bind("<MouseWheel>", lambda e: zoom_canvas(e.delta, e.x, e.y))
     canvas.bind("<Button-4>", lambda e: zoom_canvas(120, e.x, e.y))

@@ -214,5 +214,67 @@ class GcodeTests(unittest.TestCase):
         self.assertEqual(len(full_depth_plunges), 1)
 
 
+class DryRunTests(unittest.TestCase):
+    def _layout(self):
+        return app.build_layout(
+            ["AB", "CD"], FONT, 8, 10, SETTINGS["cutout_padding"],
+            SETTINGS["material_width"], SETTINGS["material_height"],
+            margin=SETTINGS["tool_diameter"] / 2,
+        )
+
+    def test_spindle_dry_run_safe_z_spindle_off(self):
+        g = app.generate_dry_run_lines(self._layout(), SETTINGS)
+        text = "\n".join(g)
+        self.assertNotIn("M3", text)
+        self.assertNotIn("M4", text)
+        self.assertEqual(z_values(g), [SETTINGS["safe_z"]], "only move Z to safe height")
+
+    def test_laser_frame_uses_frame_power_no_z(self):
+        s = dict(SETTINGS, tool_mode="Laser")
+        g = app.generate_dry_run_lines(self._layout(), s)
+        self.assertIn(f"M4 S{s['frame_power']:.0f}", "\n".join(g))
+        self.assertEqual(z_values(g), [])
+
+    def test_dry_run_bounds_match_job_bounds(self):
+        layout = self._layout()
+        job = xy_moves(app.generate_gcode_lines(layout, SETTINGS, fill_text=False))
+        dry = xy_moves(app.generate_dry_run_lines(layout, SETTINGS))
+        for axis in (0, 1):
+            self.assertAlmostEqual(min(m[axis] for m in job), min(m[axis] for m in dry), places=3)
+            self.assertAlmostEqual(max(m[axis] for m in job), max(m[axis] for m in dry), places=3)
+
+
+class SimulateTests(unittest.TestCase):
+    def setUp(self):
+        self.layout = app.build_layout(
+            ["AB"], FONT, 8, 10, SETTINGS["cutout_padding"],
+            SETTINGS["material_width"], SETTINGS["material_height"],
+            margin=SETTINGS["tool_diameter"] / 2,
+        )
+        self.gcode = app.generate_gcode_lines(self.layout, SETTINGS, fill_text=False)
+        self.segs = app.simulate_gcode(self.gcode)
+
+    def test_all_kinds_present(self):
+        kinds = {s[4] for s in self.segs}
+        self.assertEqual(kinds, {"rapid", "engrave", "cutout"})
+
+    def test_final_cutout_pass_shows_tab_gaps(self):
+        def length(kind_segs):
+            return sum(math.hypot(x1 - x0, y1 - y0) for x0, y0, x1, y1, _, _ in
+                       ((s[0], s[1], s[2], s[3], s[4], s[5]) for s in kind_segs))
+
+        cut = [s for s in self.segs if s[4] == "cutout"]
+        final_z = min(s[5] for s in cut)
+        first_z = max(s[5] for s in cut)
+        full = length([s for s in cut if s[5] == first_z])
+        final = length([s for s in cut if s[5] == final_z])
+        # final pass perimeter is shorter by one tab gap per side
+        self.assertAlmostEqual(full - final, 4 * SETTINGS["tab_width"], places=2)
+
+    def test_engrave_moves_at_text_depth(self):
+        engrave_zs = {s[5] for s in self.segs if s[4] == "engrave"}
+        self.assertEqual(engrave_zs, {-SETTINGS["text_cut_depth"]})
+
+
 if __name__ == "__main__":
     unittest.main()
