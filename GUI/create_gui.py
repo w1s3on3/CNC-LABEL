@@ -410,6 +410,20 @@ def generate_dry_run_lines(layout, settings):
 # COM port; the $$ dump and <Idle|WPos:...> reports come over that link)
 # ---------------------------------------------------------------------------
 
+_log_sink = [None]
+
+
+def set_log_sink(fn):
+    """Route app_log() messages somewhere (the GUI console). None = discard."""
+    _log_sink[0] = fn
+
+
+def app_log(message):
+    sink = _log_sink[0]
+    if sink:
+        sink(str(message))
+
+
 GRBL_SETTING_DESCRIPTIONS = {
     0: "Step pulse (µs)", 1: "Step idle delay (ms)", 2: "Step polarity mask",
     3: "Direction polarity mask", 4: "Invert step enable", 5: "Invert limit pins",
@@ -456,10 +470,11 @@ def await_ok(ser, context=""):
         if resp == "ok":
             return None
         if resp.startswith(("error", "ALARM")):
+            app_log(f"RX {resp}")
             return resp
         if not resp:
             raise TimeoutError(f"no response from GRBL {context}".strip())
-        # <status> reports, [MSG:...], startup banner: keep reading
+        app_log(f"RX {resp}")  # <status> reports, [MSG:...], banner: keep reading
 
 
 class WebSocketLink:
@@ -571,8 +586,32 @@ def open_grbl(target, baud):
     """Open a GRBL link — see link_kind for accepted target forms."""
     kind = link_kind(target)
     if kind == "ws":
+        app_log(f"Opening websocket {target}")
         link = WebSocketLink(target)
+        # ESP3D-style boards ignore websocket input entirely; they announce
+        # themselves with CURRENT_ID/ACTIVE_ID frames on connect. Detect that
+        # and switch to HTTP command mode instead of timing out on $$.
+        link.ws.settimeout(1.5)
+        seen = []
+        try:
+            while len(seen) < 4:
+                seen.append(link.ws.recv())
+        except Exception:
+            pass
+        link.ws.settimeout(link.timeout)
+        if any(str(f).startswith(("CURRENT_ID", "ACTIVE_ID")) for f in seen):
+            host = re.sub(r"^wss?://", "", target).split("/", 1)[0]
+            app_log(f"ESP3D board detected on {target} — "
+                    f"switching to HTTP command mode ({host})")
+            link.close()
+            link = ESP3DLink(host)
+        else:
+            for f in seen:  # keep any real data we swallowed while probing
+                if isinstance(f, str):
+                    f = f.encode("latin-1", "replace")
+                link.buffer += f
     elif kind == "esp3d":
+        app_log(f"Opening ESP3D wifi link to {target}")
         link = ESP3DLink(target)
     else:
         try:
@@ -583,6 +622,7 @@ def open_grbl(target, baud):
                 "run: pip install pyserial"
             ) from None
 
+        app_log(f"Opening {target} at {baud} baud (serial)")
         link = serial.Serial(target, baud, timeout=5)
         link.write(b"\r\n\r\n")  # wake GRBL
         time.sleep(2)
@@ -597,12 +637,15 @@ def stream_gcode_serial(port, baud, lines, on_progress=None, abort=None):
     cmds = sendable_lines(lines)
     errors = 0
     with open_grbl(port, baud) as ser:
+        app_log(f"Streaming {len(cmds)} lines")
         for i, cmd in enumerate(cmds, 1):
             if abort is not None and abort.is_set():
+                app_log("ABORT: feed hold + soft reset")
                 ser.write(b"!")        # feed hold
                 time.sleep(0.2)
                 ser.write(b"\x18")     # soft reset: abandon the job
                 return i - 1, errors
+            app_log(f"TX {cmd}")
             ser.write((cmd + "\n").encode("ascii"))
             if await_ok(ser, f"at line {i} ({cmd!r})"):
                 errors += 1
@@ -614,6 +657,7 @@ def stream_gcode_serial(port, baud, lines, on_progress=None, abort=None):
 def grbl_read_settings(port, baud):
     """Query $$ and return {number: value_string}."""
     with open_grbl(port, baud) as ser:
+        app_log("TX $$")
         ser.write(b"$$\n")
         lines = []
         while True:
@@ -622,6 +666,7 @@ def grbl_read_settings(port, baud):
                 break
             if not resp:
                 raise TimeoutError("no response to $$")
+            app_log(f"RX {resp}")
             lines.append(resp)
     return parse_grbl_settings(lines)
 
@@ -632,6 +677,7 @@ def grbl_write_settings(port, baud, changes):
     problems = []
     with open_grbl(port, baud) as ser:
         for num, val in sorted(changes.items()):
+            app_log(f"TX ${num}={val}")
             ser.write(f"${num}={val}\n".encode("ascii"))
             err = await_ok(ser, f"writing ${num}")
             if err:
@@ -699,6 +745,47 @@ def main():
         "drag": None,
         "font_path": next(iter(system_fonts.values())),
     }
+
+    # --- console window ---
+    console_state = {"win": None, "text": None}
+    log_history = []
+
+    def append_console(line):
+        text = console_state["text"]
+        if text is not None and text.winfo_exists():
+            text.config(state="normal")
+            text.insert("end", line + "\n")
+            text.see("end")
+            text.config(state="disabled")
+
+    def gui_log(message):
+        line = f"[{time.strftime('%H:%M:%S')}] {message}"
+        log_history.append(line)
+        del log_history[:-5000]
+        root.after(0, lambda: append_console(line))
+
+    set_log_sink(gui_log)
+
+    def open_console():
+        if console_state["win"] is not None and console_state["win"].winfo_exists():
+            console_state["win"].lift()
+            return
+        win = Toplevel(root)
+        win.title("Console")
+        text = tk.Text(win, width=100, height=26, state="disabled",
+                       bg="black", fg="#66ff66", font=("Consolas", 9))
+        scroll = tk.Scrollbar(win, command=text.yview)
+        text.config(yscrollcommand=scroll.set)
+        text.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        win.grid_rowconfigure(0, weight=1)
+        win.grid_columnconfigure(0, weight=1)
+        console_state["win"], console_state["text"] = win, text
+        if log_history:
+            text.config(state="normal")
+            text.insert("end", "\n".join(log_history) + "\n")
+            text.see("end")
+            text.config(state="disabled")
 
     def parse_label_size(raw):
         """'Auto' -> None, '60x20' -> (60.0, 20.0); raises ValueError otherwise."""
@@ -892,7 +979,10 @@ def main():
         if file_path:
             with open(file_path, "w") as f:
                 f.write("\n".join(gcode))
+            app_log(f"Exported {len(gcode)} lines of G-code to {file_path}")
             messagebox.showinfo("Success", f"G-code saved to {file_path}")
+        else:
+            app_log("G-code export cancelled")
 
     def export_dry_run():
         if read_inputs() is None:
@@ -903,6 +993,7 @@ def main():
             messagebox.showerror("Error", "Nothing to trace — enter at least one label")
             return
         gcode = generate_dry_run_lines(layout, cnc_settings)
+        app_log(f"Dry run generated: {len(gcode)} lines (boundary trace)")
         file_path = filedialog.asksaveasfilename(
             defaultextension=".gcode", initialfile="dry_run.gcode",
             filetypes=[("G-code files", "*.gcode")],
@@ -910,7 +1001,10 @@ def main():
         if file_path:
             with open(file_path, "w") as f:
                 f.write("\n".join(gcode))
+            app_log(f"Dry run saved to {file_path}")
             messagebox.showinfo("Success", f"Dry-run G-code saved to {file_path}")
+        else:
+            app_log("Dry run export cancelled")
 
     def open_machine_dialog():
         try:
@@ -957,6 +1051,7 @@ def main():
 
         def set_status(text):
             text = str(text)
+            app_log(f"Machine: {text}")
             if len(text) > 300:
                 text = text[:300] + "…"
             root.after(0, lambda: status.config(text=text))
@@ -1184,12 +1279,16 @@ def main():
     # --- menu bar ---
     menubar = tk.Menu(root)
     file_menu = tk.Menu(menubar, tearoff=0)
+    file_menu.add_command(label="Export G-code…", command=generate_gcode)
+    file_menu.add_command(label="Export Dry Run…", command=export_dry_run)
+    file_menu.add_separator()
     file_menu.add_command(label="Exit", command=root.destroy)
     menubar.add_cascade(label="File", menu=file_menu)
     settings_menu = tk.Menu(menubar, tearoff=0)
     settings_menu.add_command(label="Cutting Parameters…", command=open_settings)
     settings_menu.add_command(label="Machine (GRBL)…", command=open_machine_dialog)
     menubar.add_cascade(label="Settings", menu=settings_menu)
+    menubar.add_command(label="Console", command=open_console)
     menubar.add_command(label="About", command=show_about)
     root.config(menu=menubar)
 
@@ -1231,26 +1330,25 @@ def main():
         row=2, column=1, sticky="w"
     )
 
-    Button(root, text="⚙ Cutting Params", command=open_settings).grid(row=2, column=2)
-    Button(root, text="🔄 Reset Zoom", command=reset_zoom).grid(row=2, column=3)
-    Button(root, text="💾 Export G-code", command=generate_gcode).grid(row=2, column=4)
-    Button(root, text="🧭 Dry Run", command=export_dry_run).grid(row=2, column=5)
+    Button(root, text="🔄 Reset Zoom", command=reset_zoom).grid(row=2, column=2)
+    Button(root, text="💾 Export G-code", command=generate_gcode).grid(row=2, column=3)
+    Button(root, text="🧭 Dry Run", command=export_dry_run).grid(row=2, column=4)
 
     snap_var = tk.BooleanVar(value=False)
     Checkbutton(root, text="Snap to Grid", variable=snap_var, command=update_preview).grid(
-        row=2, column=6
+        row=2, column=5
     )
     fill_text_var = tk.BooleanVar(value=False)
     Checkbutton(root, text="Fill Text", variable=fill_text_var, command=update_preview).grid(
-        row=2, column=7
+        row=2, column=6
     )
     toolpath_var = tk.BooleanVar(value=False)
     Checkbutton(root, text="Toolpath", variable=toolpath_var, command=update_preview).grid(
-        row=2, column=8
+        row=2, column=7
     )
 
     canvas = Canvas(root, width=CANVAS_W, height=CANVAS_H, bg="white")
-    canvas.grid(row=3, column=0, columnspan=9, pady=10)
+    canvas.grid(row=3, column=0, columnspan=8, pady=10)
 
     canvas.bind("<MouseWheel>", lambda e: zoom_canvas(e.delta, e.x, e.y))
     canvas.bind("<Button-4>", lambda e: zoom_canvas(120, e.x, e.y))
