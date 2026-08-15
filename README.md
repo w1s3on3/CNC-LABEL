@@ -116,7 +116,7 @@ No font conversion required — just pick any installed font and go.
 
 ## ⚙️ Settings Explained
 
-When you click the **Settings** button in the GUI, you can configure and save your preferred cutting parameters:
+**Cutting Parameters** (⚙ button, or Settings menu) configures and saves your preferred cutting parameters — distinct from the machine's own GRBL `$$` settings, which live under Settings → Machine (GRBL):
 
 | Setting                | Description                                                                 |
 |------------------------|-----------------------------------------------------------------------------|

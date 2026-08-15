@@ -1104,9 +1104,20 @@ def main():
             row=6, column=0, columnspan=2, pady=(0, 6)
         )
 
+    def show_about():
+        messagebox.showinfo(
+            "About CNC Label Maker",
+            "CNC Label Maker\n\n"
+            "Generates G-code for traffolyte-style labels: engraved text, "
+            "multi-pass cutouts with holding tabs, spindle or laser, and "
+            "direct GRBL machine control over USB serial or wifi.\n\n"
+            "Copyright (C) 2025 Paul Wyers — GPL v3\n"
+            "https://github.com/w1s3on3/CNC-LABEL",
+        )
+
     def open_settings():
         win = Toplevel(root)
-        win.title("Settings")
+        win.title("Cutting Parameters")
         entries = {}
         for row, (key, text) in enumerate(SETTINGS_FIELDS):
             Label(win, text=text + ":").grid(row=row, column=0, sticky="e")
@@ -1170,6 +1181,18 @@ def main():
         state["font_path"] = system_fonts[name]
         update_preview()
 
+    # --- menu bar ---
+    menubar = tk.Menu(root)
+    file_menu = tk.Menu(menubar, tearoff=0)
+    file_menu.add_command(label="Exit", command=root.destroy)
+    menubar.add_cascade(label="File", menu=file_menu)
+    settings_menu = tk.Menu(menubar, tearoff=0)
+    settings_menu.add_command(label="Cutting Parameters…", command=open_settings)
+    settings_menu.add_command(label="Machine (GRBL)…", command=open_machine_dialog)
+    menubar.add_cascade(label="Settings", menu=settings_menu)
+    menubar.add_command(label="About", command=show_about)
+    root.config(menu=menubar)
+
     # --- widgets ---
     Label(root, text="Labels (one per line):").grid(row=0, column=0, sticky="e")
     entry = tk.Text(root, height=4, width=50)
@@ -1208,7 +1231,7 @@ def main():
         row=2, column=1, sticky="w"
     )
 
-    Button(root, text="⚙ Settings", command=open_settings).grid(row=2, column=2)
+    Button(root, text="⚙ Cutting Params", command=open_settings).grid(row=2, column=2)
     Button(root, text="🔄 Reset Zoom", command=reset_zoom).grid(row=2, column=3)
     Button(root, text="💾 Export G-code", command=generate_gcode).grid(row=2, column=4)
     Button(root, text="🧭 Dry Run", command=export_dry_run).grid(row=2, column=5)
