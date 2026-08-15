@@ -469,7 +469,13 @@ class WebSocketLink:
     transport-agnostic."""
 
     def __init__(self, url, timeout=5):
-        import websocket  # websocket-client; imported here so the GUI runs without it
+        try:
+            import websocket  # websocket-client; imported here so the GUI runs without it
+        except ImportError:
+            raise RuntimeError(
+                "wifi connections need the websocket-client package — "
+                "run: pip install websocket-client"
+            ) from None
 
         self.timeout = timeout
         self.ws = websocket.create_connection(url, timeout=timeout)
@@ -559,7 +565,13 @@ def open_grbl(target, baud):
     elif kind == "esp3d":
         link = ESP3DLink(target)
     else:
-        import serial  # pyserial; imported here so the GUI runs without it
+        try:
+            import serial  # pyserial; imported here so the GUI runs without it
+        except ImportError:
+            raise RuntimeError(
+                "serial connections need the pyserial package — "
+                "run: pip install pyserial"
+            ) from None
 
         link = serial.Serial(target, baud, timeout=5)
         link.write(b"\r\n\r\n")  # wake GRBL
