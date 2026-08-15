@@ -58,8 +58,7 @@ Follow the prompts to enter labels and generate individual `.gcode` files.
 cd GUI
 python create_gui.py
 ```
-- Type your labels (one per line)
-- Click **Preview** to see layout
+- Type your labels (one per line) — the preview updates live
 - Click **Settings** ⚙️ to configure machine-specific depths and speeds
 - Export G-code when ready
 
@@ -133,19 +132,39 @@ When you click the **Settings** button in the GUI, you can configure and save yo
 | **Cutout Padding**     | Distance from text to label border in mm (min clearance for fixed sizes)    |
 | **Laser Kerf**         | Beam kerf width in mm; cutout path is offset outward by half of it          |
 | **Tab Width/Height**   | Holding tabs left on the cutout so labels don't come loose (0 = no tabs)    |
-| **Material Width/Height** | Material size in mm (used for centering, preview and overflow warning)  |
+| **Material Width/Height** | Material size in mm (sets the preview sheet and overflow warnings)      |
 
 These settings are automatically saved to `machine_settings.json` for your next session.
 
 ---
 
+## 🔦 Spindle vs Laser Mode
+
+**Spindle** (default) generates conventional milling G-code:
+
+- `M3 S{Spindle RPM}` at the start, with a `G4` dwell so the spindle reaches speed before cutting
+- Z plunges to the configured depths at the Plunge Rate, retracts to Safe Z between strokes
+- Deep cuts are split into multiple passes (Depth per Pass), and the final cutout passes leave holding tabs so labels don't come loose
+- The cutout toolpath is offset outward by half the Tool Diameter so the finished label matches the drawn size
+
+**Laser** generates GRBL dynamic-power laser G-code — and **never moves Z**:
+
+- No Z commands at all: focus the laser manually before starting the job, and it stays at that height
+- `M4 S{Laser Power}` (dynamic mode): the beam only fires during `G1` cutting moves, so rapids between letters/labels don't leave burn marks
+- The depth settings become pass counts: `Label Cutout Depth ÷ Depth per Pass` = number of times the cutout is traced (e.g. 1.6 / 0.4 = 4 passes); same for text
+- The cutout is offset by half the Laser Kerf instead of the tool radius; holding tabs are skipped (they only make sense as uncut material thickness on a spindle)
+
+---
+
 ## 📦 Coming Soon
 
-- [ ] Multiline Support
-- [ ] Style Support (Fix infil)
+- [ ] Multiline text within one label
+- [ ] Grid/sheet nesting in the GUI (rows × columns across the stock)
+- [ ] Dry run / frame mode (trace the job boundary at Safe Z or low power)
+- [ ] Toolpath preview (rapids, cut order, tabs)
+- [ ] Rounded corners & mounting holes
 - [ ] SVG export
 - [ ] Barcode & QR code support
-- [ ] Font switching
 - [ ] .exe release for Windows users
 - [ ] Let me know what else  
 
