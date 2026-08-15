@@ -85,11 +85,12 @@ python -m unittest discover tests
 ### ✅ Usage Notes
 - Use one label per line (no commas needed)
 - Multi-word labels supported
+- Labels stack upward from the work origin (bottom-left of the material); the first label's cutout toolpath starts exactly at X0 Y0
 - Text is centered in each label cutout
 - **Label Size**: pick a preset (or type e.g. `60x20`) for fixed-size labels; labels whose text doesn't fit are shown in red. `Auto` sizes each label from its text
 - Toggle Grid Snap for precision
-- Mouse scroll to zoom (centred, display-only), Reset button to restore
-- The preview always fits the whole material sheet; the green cross marks work zero (X0 Y0)
+- Mouse scroll to zoom at the cursor, drag (left or middle button) to pan — both display-only, the exported job never changes
+- The preview fits the whole material sheet at Reset Zoom; the green cross marks work zero (X0 Y0)
 
 A modernized version using **TrueType fonts** for accurate rendering, cutouts, and export.
 

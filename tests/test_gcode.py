@@ -65,7 +65,7 @@ class TextGeometryTests(unittest.TestCase):
 
 class LabelSizeTests(unittest.TestCase):
     def test_fixed_size_cutout_and_centering(self):
-        layout = app.build_layout(["AB"], FONT, 8, 10, 2, 300, label_size=(60, 20))
+        layout = app.build_layout(["AB"], FONT, 8, 10, 2, 300, 200, label_size=(60, 20))
         item = layout[0]
         x0, y0, x1, y1 = item["cutout"]
         self.assertAlmostEqual(x1 - x0, 60)
@@ -76,11 +76,11 @@ class LabelSizeTests(unittest.TestCase):
         self.assertAlmostEqual(item["y_top"] - y0, y1 - (item["y_top"] + item["height"]), places=6)
 
     def test_too_small_label_flagged(self):
-        layout = app.build_layout(["MUCH TOO LONG"], FONT, 8, 10, 2, 300, label_size=(20, 10))
+        layout = app.build_layout(["MUCH TOO LONG"], FONT, 8, 10, 2, 300, 200, label_size=(20, 10))
         self.assertFalse(layout[0]["fits"])
 
     def test_auto_size_still_fits_text(self):
-        layout = app.build_layout(["AB"], FONT, 8, 10, 2, 300)
+        layout = app.build_layout(["AB"], FONT, 8, 10, 2, 300, 200)
         item = layout[0]
         x0, y0, x1, y1 = item["cutout"]
         self.assertAlmostEqual(x1 - x0, item["width"] + 4)
@@ -93,7 +93,7 @@ class KerfTests(unittest.TestCase):
         s = dict(SETTINGS, tab_width=0.0, tab_height=0.0)
         layout = app.build_layout(
             ["AB"], FONT, 8, 10, s["cutout_padding"], s["material_width"],
-            label_size=(60, 20),
+            s["material_height"], label_size=(60, 20),
         )
         g = app.generate_gcode_lines(layout, s, fill_text=False)
         x0, _, x1, _ = layout[0]["cutout"]
@@ -105,6 +105,7 @@ class KerfTests(unittest.TestCase):
     def test_work_origin_offset_shifts_all_moves(self):
         layout = app.build_layout(
             ["AB"], FONT, 8, 10, SETTINGS["cutout_padding"], SETTINGS["material_width"],
+            SETTINGS["material_height"],
         )
         base = xy_moves(app.generate_gcode_lines(layout, SETTINGS, fill_text=False))
         s = dict(SETTINGS, offset_x=25.0, offset_y=-10.0)
@@ -118,7 +119,7 @@ class KerfTests(unittest.TestCase):
         s = dict(SETTINGS, tool_mode="Laser", laser_kerf=0.2)
         layout = app.build_layout(
             ["AB"], FONT, 8, 10, s["cutout_padding"], s["material_width"],
-            label_size=(60, 20),
+            s["material_height"], label_size=(60, 20),
         )
         g = app.generate_gcode_lines(layout, s, fill_text=False)
         x0, _, x1, _ = layout[0]["cutout"]
@@ -128,10 +129,11 @@ class KerfTests(unittest.TestCase):
 
 
 class GcodeTests(unittest.TestCase):
-    def layout(self, labels=("TEST",), font_height=10):
+    def layout(self, labels=("TEST",), font_height=10, margin=0.0):
         return app.build_layout(
             list(labels), FONT, font_height, 10,
             SETTINGS["cutout_padding"], SETTINGS["material_width"],
+            SETTINGS["material_height"], margin=margin,
         )
 
     def test_spindle_on_and_off(self):
@@ -155,7 +157,10 @@ class GcodeTests(unittest.TestCase):
         self.assertEqual(min(z_values(g)), -0.9)
 
     def test_moves_inside_material(self):
-        g = app.generate_gcode_lines(self.layout(), SETTINGS, fill_text=True)
+        # margin = kerf radius, matching how the GUI builds its layout
+        g = app.generate_gcode_lines(
+            self.layout(margin=SETTINGS["tool_diameter"] / 2), SETTINGS, fill_text=True
+        )
         for x, y in xy_moves(g):
             self.assertGreaterEqual(x, -0.01)
             self.assertLessEqual(x, SETTINGS["material_width"] + 0.01)
@@ -174,14 +179,14 @@ class GcodeTests(unittest.TestCase):
         bottom = geom.intersection(app.LineString([(-1, miny + 0.2), (maxx + 1, miny + 0.2)]))
         self.assertLess(top.length, bottom.length, "L: top row must be narrower than bottom bar")
 
-    def test_machine_y_flip_consistent(self):
-        # First label sits near the top of the material -> high machine Y
-        g = app.generate_gcode_lines(self.layout(), SETTINGS, fill_text=False)
-        ys = [y for _, y in xy_moves(g)]
-        self.assertGreater(
-            min(ys), SETTINGS["material_height"] / 4,
-            "a single top-placed label must map to the upper part of machine Y space",
-        )
+    def test_job_starts_at_work_origin(self):
+        # Layout margin = kerf radius, so the cutout toolpath's lowest-left
+        # point lands exactly on X0 Y0
+        r = SETTINGS["tool_diameter"] / 2
+        g = app.generate_gcode_lines(self.layout(margin=r), SETTINGS, fill_text=False)
+        moves = xy_moves(g)
+        self.assertAlmostEqual(min(x for x, _ in moves), 0.0, places=3)
+        self.assertAlmostEqual(min(y for _, y in moves), 0.0, places=3)
 
     def test_laser_mode_has_no_z_moves(self):
         s = dict(SETTINGS, tool_mode="Laser")

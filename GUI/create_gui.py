@@ -94,6 +94,9 @@ def cap_height(font_path):
     return _cap_height_cache[font_path]
 
 
+_text_geom_cache = {}
+
+
 def text_geometry(label, font_path, font_height_mm):
     """Shapely geometry for a label with letter counters (the hole in O, A, e…)
     as real holes, scaled so capitals are font_height_mm tall.
@@ -101,6 +104,9 @@ def text_geometry(label, font_path, font_height_mm):
     Origin is the bottom-left of the text bounding box, Y up (machine-style).
     Returns None for labels with no printable outline.
     """
+    key = (label, font_path, font_height_mm)
+    if key in _text_geom_cache:
+        return _text_geom_cache[key]
     tp = TextPath((0, 0), label, prop=FontProperties(fname=font_path, size=FONT_RENDER_SIZE))
     geom = None
     # TextPath returns every contour as a plain ring — outer shapes and holes
@@ -120,7 +126,11 @@ def text_geometry(label, font_path, font_height_mm):
     scale = font_height_mm / cap_height(font_path)
     geom = shapely.affinity.scale(geom, xfact=scale, yfact=scale, origin=(0, 0))
     minx, miny, _, _ = geom.bounds
-    return shapely.affinity.translate(geom, xoff=-minx, yoff=-miny)
+    geom = shapely.affinity.translate(geom, xoff=-minx, yoff=-miny)
+    if len(_text_geom_cache) > 256:
+        _text_geom_cache.clear()
+    _text_geom_cache[key] = geom
+    return geom
 
 
 def geom_polygons(geom):
@@ -156,12 +166,16 @@ def hatch_fill(geom, spacing):
 
 
 def build_layout(labels, font_path, font_height_mm, spacing, padding,
-                 material_width, snap_grid=None, label_size=None):
-    """Place labels top-down on the material, centered horizontally.
+                 material_width, material_height, snap_grid=None,
+                 label_size=None, margin=0.0):
+    """Stack labels upward from the work origin (bottom-left of material).
 
     Coordinates are "canvas" mm: origin top-left, Y increases downward (what
-    the preview shows). Each item's geom keeps its own origin (text bbox
-    bottom-left, Y up); x/y_top place that box on the material.
+    the preview shows). The first label's box sits at the material's
+    bottom-left corner, inset by margin on both axes — callers pass the
+    kerf/tool radius as margin so the cutout toolpath starts exactly at
+    X0 Y0. Each item's geom keeps its own origin (text bbox bottom-left,
+    Y up); x/y_top place that box on the material.
 
     label_size: (width, height) in mm for fixed-size labels, or None to size
     each label from its text (bbox + padding). A fixed-size label whose text
@@ -172,7 +186,7 @@ def build_layout(labels, font_path, font_height_mm, spacing, padding,
         return round(v / snap_grid) * snap_grid if snap_grid else v
 
     items = []
-    cursor = 40.0  # canvas y of the top edge of the next label
+    bottom = material_height - margin  # canvas y of the current stack bottom
     for label in labels:
         geom = text_geometry(label, font_path, font_height_mm)
         if geom is None:
@@ -185,8 +199,8 @@ def build_layout(labels, font_path, font_height_mm, spacing, padding,
         else:
             label_w, label_h = width + 2 * padding, height + 2 * padding
             fits = True
-        bx0 = snap((material_width - label_w) / 2)
-        by0 = snap(cursor)
+        bx0 = snap(margin)
+        by0 = snap(bottom - label_h)
         items.append({
             "label": label, "geom": geom,
             "x": bx0 + (label_w - width) / 2,
@@ -195,7 +209,7 @@ def build_layout(labels, font_path, font_height_mm, spacing, padding,
             "cutout": (bx0, by0, bx0 + label_w, by0 + label_h),
             "fits": fits,
         })
-        cursor = by0 + label_h + spacing
+        bottom = by0 - spacing
     return items
 
 
@@ -365,6 +379,8 @@ def main():
 
     state = {
         "zoom": 1.0,
+        "pan": [0.0, 0.0],   # screen-px offset from drag-panning
+        "drag": None,
         "font_path": next(iter(system_fonts.values())),
     }
 
@@ -395,11 +411,14 @@ def main():
         if inputs is None:
             return None
         labels, font_height, spacing, label_size = inputs
+        laser = cnc_settings["tool_mode"] == "Laser"
+        kerf_r = (cnc_settings["laser_kerf"] if laser else cnc_settings["tool_diameter"]) / 2
         return build_layout(
             labels, state["font_path"], font_height, spacing,
             cnc_settings["cutout_padding"], cnc_settings["material_width"],
+            cnc_settings["material_height"],
             snap_grid=SNAP_GRID_MM if snap_var.get() else None,
-            label_size=label_size,
+            label_size=label_size, margin=kerf_r,
         )
 
     def update_preview():
@@ -417,12 +436,13 @@ def main():
         # canvas at zoom 1, and zoom about the canvas centre so content stays
         # in view.
         scale = min(CANVAS_W / mat_w, CANVAS_H / mat_h) * 0.95 * state["zoom"]
+        pan_x, pan_y = state["pan"]
 
         def sx(wx):
-            return (wx - mat_w / 2) * scale + CANVAS_W / 2
+            return (wx - mat_w / 2) * scale + CANVAS_W / 2 + pan_x
 
         def sy(wy):
-            return (wy - mat_h / 2) * scale + CANVAS_H / 2
+            return (wy - mat_h / 2) * scale + CANVAS_H / 2 + pan_y
 
         # Material boundary and work zero (machine origin = bottom-left)
         canvas.create_rectangle(sx(0), sy(0), sx(mat_w), sy(mat_h), outline="gray")
@@ -443,8 +463,8 @@ def main():
                 pts = np.asarray(coords, dtype=float).copy()
                 wx = pts[:, 0] + x
                 wy = y_top + height - pts[:, 1]
-                pts[:, 0] = (wx - mat_w / 2) * scale + CANVAS_W / 2
-                pts[:, 1] = (wy - mat_h / 2) * scale + CANVAS_H / 2
+                pts[:, 0] = (wx - mat_w / 2) * scale + CANVAS_W / 2 + pan_x
+                pts[:, 1] = (wy - mat_h / 2) * scale + CANVAS_H / 2 + pan_y
                 return pts
 
             if fill_text_var.get():
@@ -469,7 +489,7 @@ def main():
                 sx(cx0), sy(cy0), sx(cx1), sy(cy1),
                 outline="blue" if item["fits"] else "red", dash=(2, 2),
             )
-            if cy1 > mat_h or cx0 < 0:
+            if cx1 > mat_w or cy0 < 0:
                 overflow = True
 
         warnings = []
@@ -493,7 +513,7 @@ def main():
             return
         problems = []
         if any(
-            item["cutout"][3] > cnc_settings["material_height"] or item["cutout"][0] < 0
+            item["cutout"][2] > cnc_settings["material_width"] or item["cutout"][1] < 0
             for item in layout
         ):
             problems.append("labels exceed the material size")
@@ -551,12 +571,29 @@ def main():
             row=len(SETTINGS_FIELDS) + 1, column=0, columnspan=2, pady=10
         )
 
-    def zoom_canvas(delta):
-        state["zoom"] *= 1.1 if delta > 0 else 0.9
+    def zoom_canvas(delta, px, py):
+        f = 1.1 if delta > 0 else 0.9
+        # Keep the world point under the cursor stationary while zooming
+        state["pan"][0] = (px - CANVAS_W / 2) * (1 - f) + state["pan"][0] * f
+        state["pan"][1] = (py - CANVAS_H / 2) * (1 - f) + state["pan"][1] * f
+        state["zoom"] *= f
+        update_preview()
+
+    def start_pan(event):
+        state["drag"] = (event.x, event.y)
+
+    def do_pan(event):
+        if state["drag"] is None:
+            return
+        lx, ly = state["drag"]
+        state["pan"][0] += event.x - lx
+        state["pan"][1] += event.y - ly
+        state["drag"] = (event.x, event.y)
         update_preview()
 
     def reset_zoom():
         state["zoom"] = 1.0
+        state["pan"] = [0.0, 0.0]
         update_preview()
 
     def select_font(name):
@@ -617,9 +654,13 @@ def main():
     canvas = Canvas(root, width=CANVAS_W, height=CANVAS_H, bg="white")
     canvas.grid(row=3, column=0, columnspan=7, pady=10)
 
-    canvas.bind("<MouseWheel>", lambda e: zoom_canvas(e.delta))
-    canvas.bind("<Button-4>", lambda e: zoom_canvas(120))
-    canvas.bind("<Button-5>", lambda e: zoom_canvas(-120))
+    canvas.bind("<MouseWheel>", lambda e: zoom_canvas(e.delta, e.x, e.y))
+    canvas.bind("<Button-4>", lambda e: zoom_canvas(120, e.x, e.y))
+    canvas.bind("<Button-5>", lambda e: zoom_canvas(-120, e.x, e.y))
+    for press, motion in (("<ButtonPress-1>", "<B1-Motion>"),
+                          ("<ButtonPress-2>", "<B2-Motion>")):
+        canvas.bind(press, start_pan)
+        canvas.bind(motion, do_pan)
     entry.bind("<KeyRelease>", lambda e: update_preview())
     font_height_entry.bind("<KeyRelease>", lambda e: update_preview())
     spacing_entry.bind("<KeyRelease>", lambda e: update_preview())
