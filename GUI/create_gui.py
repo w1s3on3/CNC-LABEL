@@ -18,6 +18,8 @@ import json
 import math
 import os
 import re
+import threading
+import time
 import tkinter as tk
 from tkinter import (
     StringVar, OptionMenu, Label, Canvas, Entry, Toplevel, Button,
@@ -402,6 +404,122 @@ def generate_dry_run_lines(layout, settings):
 
 
 # ---------------------------------------------------------------------------
+# Machine link — GRBL over USB serial (a stock CNC 3018 is GRBL 1.1 on a
+# COM port; the $$ dump and <Idle|WPos:...> reports come over that link)
+# ---------------------------------------------------------------------------
+
+GRBL_SETTING_DESCRIPTIONS = {
+    0: "Step pulse (µs)", 1: "Step idle delay (ms)", 2: "Step polarity mask",
+    3: "Direction polarity mask", 4: "Invert step enable", 5: "Invert limit pins",
+    6: "Invert probe pin", 10: "Status report mask", 11: "Junction deviation (mm)",
+    12: "Arc tolerance (mm)", 13: "Report in inches", 20: "Soft limits enable",
+    21: "Hard limits enable", 22: "Homing cycle enable", 23: "Homing direction mask",
+    24: "Homing feed (mm/min)", 25: "Homing seek (mm/min)", 26: "Homing debounce (ms)",
+    27: "Homing pull-off (mm)", 30: "Max spindle speed (RPM)",
+    31: "Min spindle speed (RPM)", 32: "Laser mode enable",
+    100: "X steps/mm", 101: "Y steps/mm", 102: "Z steps/mm",
+    110: "X max rate (mm/min)", 111: "Y max rate (mm/min)", 112: "Z max rate (mm/min)",
+    120: "X acceleration (mm/s²)", 121: "Y acceleration (mm/s²)",
+    122: "Z acceleration (mm/s²)",
+    130: "X max travel (mm)", 131: "Y max travel (mm)", 132: "Z max travel (mm)",
+}
+
+
+def sendable_lines(lines):
+    """G-code lines worth transmitting: comments and blanks stripped."""
+    out = []
+    for line in lines:
+        cmd = line.split(";", 1)[0].strip()
+        if cmd and not cmd.startswith("("):
+            out.append(cmd)
+    return out
+
+
+def parse_grbl_settings(lines):
+    """$$ dump lines -> {setting_number: value_string}. Ignores everything
+    else (status reports, ok, banners)."""
+    out = {}
+    for line in lines:
+        m = re.match(r"\$(\d+)=(-?\d+\.?\d*)", line.strip())
+        if m:
+            out[int(m.group(1))] = m.group(2)
+    return out
+
+
+def await_ok(ser, context=""):
+    """Read GRBL responses until ok (returns None) or error/ALARM (returns
+    the message). Status chatter like <Idle|WPos:...> is ignored."""
+    while True:
+        resp = ser.readline().decode(errors="ignore").strip()
+        if resp == "ok":
+            return None
+        if resp.startswith(("error", "ALARM")):
+            return resp
+        if not resp:
+            raise TimeoutError(f"no response from GRBL {context}".strip())
+        # <status> reports, [MSG:...], startup banner: keep reading
+
+
+def open_grbl(port, baud):
+    import serial  # pyserial; imported here so the GUI runs without it
+
+    ser = serial.Serial(port, baud, timeout=5)
+    ser.write(b"\r\n\r\n")  # wake GRBL
+    time.sleep(2)
+    ser.reset_input_buffer()
+    return ser
+
+
+def stream_gcode_serial(port, baud, lines, on_progress=None, abort=None):
+    """Stream a job to GRBL call-and-response style (send a line, wait for
+    ok). Simple and reliable for label-sized jobs. Returns (sent, errors).
+    Setting the abort event feed-holds then soft-resets the controller."""
+    cmds = sendable_lines(lines)
+    errors = 0
+    with open_grbl(port, baud) as ser:
+        for i, cmd in enumerate(cmds, 1):
+            if abort is not None and abort.is_set():
+                ser.write(b"!")        # feed hold
+                time.sleep(0.2)
+                ser.write(b"\x18")     # soft reset: abandon the job
+                return i - 1, errors
+            ser.write((cmd + "\n").encode("ascii"))
+            if await_ok(ser, f"at line {i} ({cmd!r})"):
+                errors += 1
+            if on_progress:
+                on_progress(i, len(cmds))
+    return len(cmds), errors
+
+
+def grbl_read_settings(port, baud):
+    """Query $$ and return {number: value_string}."""
+    with open_grbl(port, baud) as ser:
+        ser.write(b"$$\n")
+        lines = []
+        while True:
+            resp = ser.readline().decode(errors="ignore").strip()
+            if resp == "ok":
+                break
+            if not resp:
+                raise TimeoutError("no response to $$")
+            lines.append(resp)
+    return parse_grbl_settings(lines)
+
+
+def grbl_write_settings(port, baud, changes):
+    """Write {number: value_string} as $n=value commands. Returns a list of
+    GRBL error strings (empty = all accepted)."""
+    problems = []
+    with open_grbl(port, baud) as ser:
+        for num, val in sorted(changes.items()):
+            ser.write(f"${num}={val}\n".encode("ascii"))
+            err = await_ok(ser, f"writing ${num}")
+            if err:
+                problems.append(f"${num}={val}: {err}")
+    return problems
+
+
+# ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 
@@ -674,6 +792,186 @@ def main():
                 f.write("\n".join(gcode))
             messagebox.showinfo("Success", f"Dry-run G-code saved to {file_path}")
 
+    def open_machine_dialog():
+        try:
+            from serial.tools import list_ports
+        except ImportError:
+            messagebox.showerror(
+                "pyserial missing",
+                "Direct machine control needs pyserial:\n\npip install pyserial",
+            )
+            return
+        ports = [p.device for p in list_ports.comports()]
+        if not ports:
+            messagebox.showerror(
+                "No serial ports",
+                "No serial ports found — is the machine connected via USB?",
+            )
+            return
+
+        win = Toplevel(root)
+        win.title("Machine (GRBL)")
+        Label(win, text="Port:").grid(row=0, column=0, sticky="e")
+        port_var = StringVar(value=ports[0])
+        OptionMenu(win, port_var, *ports).grid(row=0, column=1, sticky="w")
+        Label(win, text="Baud:").grid(row=1, column=0, sticky="e")
+        baud_entry = Entry(win, width=8)
+        baud_entry.insert(0, "115200")
+        baud_entry.grid(row=1, column=1, sticky="w")
+        dry_var = tk.BooleanVar(value=True)
+        Checkbutton(
+            win, text="Dry run only (boundary trace, no cutting)", variable=dry_var
+        ).grid(row=2, column=0, columnspan=2, sticky="w")
+        status = Label(win, text="Home/zero the machine first, then Send")
+        status.grid(row=3, column=0, columnspan=2, pady=4)
+        abort_event = threading.Event()
+        busy = [False]
+
+        def set_status(text):
+            root.after(0, lambda: status.config(text=text))
+
+        def get_baud():
+            try:
+                return int(baud_entry.get())
+            except ValueError:
+                messagebox.showerror("Error", "Baud must be a number")
+                return None
+
+        def send_worker(port, baud, lines):
+            try:
+                sent, errors = stream_gcode_serial(
+                    port, baud, lines,
+                    on_progress=lambda i, n: set_status(f"Sending… {i}/{n}"),
+                    abort=abort_event,
+                )
+                if abort_event.is_set():
+                    set_status(f"Aborted after {sent} lines — machine was reset")
+                elif errors:
+                    set_status(f"Finished with {errors} GRBL errors — check the machine")
+                else:
+                    set_status(f"Done — {sent} lines sent")
+            except Exception as exc:
+                set_status(f"Failed: {exc}")
+            finally:
+                busy[0] = False
+
+        def start_send():
+            if busy[0]:
+                return
+            if read_inputs() is None:
+                messagebox.showerror("Error", "Invalid font height, spacing or label size")
+                return
+            layout = current_layout()
+            if not layout:
+                messagebox.showerror("Error", "Nothing to send — enter at least one label")
+                return
+            baud = get_baud()
+            if baud is None:
+                return
+            lines = (
+                generate_dry_run_lines(layout, cnc_settings) if dry_var.get()
+                else generate_gcode_lines(layout, cnc_settings, fill_text_var.get())
+            )
+            abort_event.clear()
+            busy[0] = True
+            set_status("Connecting…")
+            threading.Thread(
+                target=send_worker, args=(port_var.get(), baud, lines), daemon=True
+            ).start()
+
+        def open_grbl_settings():
+            baud = get_baud()
+            if baud is None:
+                return
+            set_status("Reading $$ settings…")
+
+            def read_worker():
+                try:
+                    values = grbl_read_settings(port_var.get(), baud)
+                except Exception as exc:
+                    set_status(f"Failed to read settings: {exc}")
+                    return
+                set_status("Settings loaded")
+                root.after(0, lambda: build_editor(values))
+
+            def build_editor(values):
+                ed = Toplevel(win)
+                ed.title("GRBL Settings ($$)")
+                container = Canvas(ed, width=430, height=420)
+                scroll = tk.Scrollbar(ed, orient="vertical", command=container.yview)
+                inner = tk.Frame(container)
+                inner.bind(
+                    "<Configure>",
+                    lambda e: container.configure(scrollregion=container.bbox("all")),
+                )
+                container.create_window((0, 0), window=inner, anchor="nw")
+                container.configure(yscrollcommand=scroll.set)
+                container.grid(row=0, column=0)
+                scroll.grid(row=0, column=1, sticky="ns")
+                container.bind_all(
+                    "<MouseWheel>",
+                    lambda e: container.yview_scroll(-1 if e.delta > 0 else 1, "units"),
+                )
+
+                entries = {}
+                for row, num in enumerate(sorted(values)):
+                    desc = GRBL_SETTING_DESCRIPTIONS.get(num, "")
+                    Label(inner, text=f"${num}", width=6, anchor="e").grid(row=row, column=0)
+                    e = Entry(inner, width=12)
+                    e.insert(0, values[num])
+                    e.grid(row=row, column=1, padx=4)
+                    Label(inner, text=desc, anchor="w").grid(row=row, column=2, sticky="w")
+                    entries[num] = e
+
+                ed_status = Label(ed, text=f"{len(values)} settings read")
+                ed_status.grid(row=1, column=0, columnspan=2)
+
+                def write_changes():
+                    changes = {
+                        num: e.get().strip()
+                        for num, e in entries.items()
+                        if e.get().strip() != values[num]
+                    }
+                    if not changes:
+                        ed_status.config(text="Nothing changed")
+                        return
+                    summary = ", ".join(f"${n}={v}" for n, v in sorted(changes.items()))
+                    if not messagebox.askyesno(
+                        "Write GRBL settings",
+                        f"Write {len(changes)} change(s) to the controller?\n\n{summary}",
+                        parent=ed,
+                    ):
+                        return
+                    ed_status.config(text="Writing…")
+
+                    def write_worker():
+                        try:
+                            problems = grbl_write_settings(port_var.get(), baud, changes)
+                        except Exception as exc:
+                            root.after(0, lambda: ed_status.config(text=f"Failed: {exc}"))
+                            return
+                        if problems:
+                            msg = "; ".join(problems)
+                        else:
+                            msg = f"Wrote {len(changes)} setting(s) OK"
+                            for num, val in changes.items():
+                                values[num] = val
+                        root.after(0, lambda: ed_status.config(text=msg))
+
+                    threading.Thread(target=write_worker, daemon=True).start()
+
+                Button(ed, text="💾 Write Changes", command=write_changes).grid(
+                    row=2, column=0, columnspan=2, pady=6
+                )
+
+            threading.Thread(target=read_worker, daemon=True).start()
+
+        Button(win, text="▶ Send", command=start_send).grid(row=4, column=0, pady=6)
+        Button(win, text="⛔ Abort", command=abort_event.set).grid(row=4, column=1, pady=6)
+        Button(win, text="⚙ GRBL Settings ($$)", command=open_grbl_settings).grid(
+            row=5, column=0, columnspan=2, pady=(0, 6)
+        )
+
     def open_settings():
         win = Toplevel(root)
         win.title("Settings")
@@ -782,6 +1080,7 @@ def main():
     Button(root, text="🔄 Reset Zoom", command=reset_zoom).grid(row=2, column=3)
     Button(root, text="💾 Export G-code", command=generate_gcode).grid(row=2, column=4)
     Button(root, text="🧭 Dry Run", command=export_dry_run).grid(row=2, column=5)
+    Button(root, text="📡 Machine", command=open_machine_dialog).grid(row=2, column=9)
 
     snap_var = tk.BooleanVar(value=False)
     Checkbutton(root, text="Snap to Grid", variable=snap_var, command=update_preview).grid(
@@ -797,7 +1096,7 @@ def main():
     )
 
     canvas = Canvas(root, width=CANVAS_W, height=CANVAS_H, bg="white")
-    canvas.grid(row=3, column=0, columnspan=9, pady=10)
+    canvas.grid(row=3, column=0, columnspan=10, pady=10)
 
     canvas.bind("<MouseWheel>", lambda e: zoom_canvas(e.delta, e.x, e.y))
     canvas.bind("<Button-4>", lambda e: zoom_canvas(120, e.x, e.y))

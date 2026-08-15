@@ -276,5 +276,60 @@ class SimulateTests(unittest.TestCase):
         self.assertEqual(engrave_zs, {-SETTINGS["text_cut_depth"]})
 
 
+class MachineLinkTests(unittest.TestCase):
+    # Excerpt of a real $$ dump + status chatter from a CNC 3018 console log
+    GRBL_DUMP = """\
+$0=10
+$1=5
+$21=1
+$30=1000.000
+$32=1
+$100=3200.000
+$110=1000.000
+$120=50.000
+$130=298.000
+$131=170.000
+$132=80.000
+<Idle|WPos:2.000,168.000,0.000|FS:0,0|PS:100|PF:100>
+<Idle|WPos:2.000,168.000,0.000|FS:0,0|WCO:0.000,-170.000,0.000|PS:100|PF:100>
+$J=G91 G21 F1500 Y-50
+ok""".splitlines()
+
+    def test_parse_grbl_settings(self):
+        settings = app.parse_grbl_settings(self.GRBL_DUMP)
+        self.assertEqual(settings[130], "298.000")
+        self.assertEqual(settings[0], "10")
+        self.assertEqual(len(settings), 11, "status/jog/ok lines must be ignored")
+
+    def test_sendable_lines_strips_comments(self):
+        lines = [
+            "G21 ; units: mm",
+            "(Label: PUMP 1)",
+            "",
+            "G1 X5.000 Y0.000 F300",
+            "M2 ; end program",
+        ]
+        self.assertEqual(
+            app.sendable_lines(lines), ["G21", "G1 X5.000 Y0.000 F300", "M2"]
+        )
+
+    def test_await_ok_ignores_status_chatter(self):
+        class FakeSerial:
+            def __init__(self, responses):
+                self.responses = list(responses)
+
+            def readline(self):
+                return (self.responses.pop(0) + "\n").encode() if self.responses else b""
+
+        self.assertIsNone(app.await_ok(FakeSerial([
+            "<Idle|WPos:2.000,168.000,0.000|FS:0,0|PS:100|PF:100>",
+            "[MSG:...]",
+            "ok",
+        ])))
+        self.assertEqual(app.await_ok(FakeSerial(["error:3"])), "error:3")
+        with self.assertRaises(TimeoutError):
+            app.await_ok(FakeSerial([]))
+
+
 if __name__ == "__main__":
     unittest.main()

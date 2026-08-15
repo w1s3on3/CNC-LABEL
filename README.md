@@ -158,6 +158,25 @@ These settings are automatically saved to `machine_settings.json` for your next 
 
 ---
 
+## 📡 Send to Machine (GRBL over USB)
+
+A stock CNC 3018 runs **GRBL 1.1 over USB serial** — the **📡 Machine** button talks to it directly (needs `pyserial`, included in requirements):
+
+- Pick the COM port and baud (115200 is the GRBL default), then **Send**
+- **Dry run only** is ticked by default — the first send traces the job boundary at Safe Z / Frame Power so you can check placement before cutting anything
+- Streaming is call-and-response (each line waits for GRBL's `ok`), with live progress and an **Abort** button that feed-holds (`!`) and soft-resets (`Ctrl-X`) the controller
+- **Home/zero the machine first** — the app sends the job as-is against your current work zero
+
+### ⚙ GRBL Settings ($$)
+
+The Machine dialog can also read and edit the controller's `$$` parameters (steps/mm, max rates, accelerations, travel limits, homing, laser mode, …):
+
+- Reads the full `$$` dump and shows each `$n` with a description and editable value
+- Only changed values are written (as `$n=value`), after a confirmation listing exactly what will be sent
+- Status reports (`<Idle|WPos:...>`) and other chatter on the line are handled/ignored automatically
+
+---
+
 ## 📦 Coming Soon
 
 - [ ] Multiline text within one label
