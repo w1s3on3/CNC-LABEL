@@ -160,9 +160,15 @@ These settings are automatically saved to `machine_settings.json` for your next 
 
 ## 📡 Send to Machine (GRBL over USB)
 
-A stock CNC 3018 runs **GRBL 1.1 over USB serial** — the **📡 Machine** button talks to it directly (needs `pyserial`, included in requirements):
+The **📡 Machine** button talks to a GRBL 1.1 controller directly, over any of three transports (auto-detected from what you type in the *Connect to* box):
 
-- Pick the COM port and baud (115200 is the GRBL default), then **Send**
+| Connect to | Transport |
+|---|---|
+| `COM3` / `/dev/ttyUSB0` | USB serial (needs `pyserial`), 115200 baud default |
+| `192.168.1.207` | **ESP3D-style wifi board** (the common 3018 wifi module): commands go via HTTP `/command?plain=…`, GRBL output streams back on the websocket at port 81 |
+| `ws://host:81` | Raw bidirectional websocket GRBL (FluidNC / GRBL_ESP32) |
+
+- Pick the connection, then **Send**
 - **Dry run only** is ticked by default — the first send traces the job boundary at Safe Z / Frame Power so you can check placement before cutting anything
 - Streaming is call-and-response (each line waits for GRBL's `ok`), with live progress and an **Abort** button that feed-holds (`!`) and soft-resets (`Ctrl-X`) the controller
 - **Home/zero the machine first** — the app sends the job as-is against your current work zero

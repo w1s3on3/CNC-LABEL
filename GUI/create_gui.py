@@ -21,6 +21,8 @@ import re
 import threading
 import time
 import tkinter as tk
+import urllib.parse
+import urllib.request
 from tkinter import (
     StringVar, OptionMenu, Label, Canvas, Entry, Toplevel, Button,
     Checkbutton, filedialog, messagebox,
@@ -460,14 +462,110 @@ def await_ok(ser, context=""):
         # <status> reports, [MSG:...], startup banner: keep reading
 
 
-def open_grbl(port, baud):
-    import serial  # pyserial; imported here so the GUI runs without it
+class WebSocketLink:
+    """GRBL over a websocket (ESP32/FluidNC/vendor wifi boards speak the same
+    line protocol as serial, typically on ws://<ip>:81). Exposes the same
+    write/readline interface as pyserial so the rest of the code is
+    transport-agnostic."""
 
-    ser = serial.Serial(port, baud, timeout=5)
-    ser.write(b"\r\n\r\n")  # wake GRBL
-    time.sleep(2)
-    ser.reset_input_buffer()
-    return ser
+    def __init__(self, url, timeout=5):
+        import websocket  # websocket-client; imported here so the GUI runs without it
+
+        self.timeout = timeout
+        self.ws = websocket.create_connection(url, timeout=timeout)
+        self.buffer = b""
+
+    def write(self, data):
+        if isinstance(data, bytes):
+            data = data.decode("latin-1")
+        self.ws.send(data)
+
+    def readline(self):
+        while b"\n" not in self.buffer:
+            try:
+                frame = self.ws.recv()
+            except Exception:  # timeout / closed: report like a serial timeout
+                return b""
+            if isinstance(frame, str):
+                frame = frame.encode("latin-1", errors="replace")
+            self.buffer += frame
+        line, _, self.buffer = self.buffer.partition(b"\n")
+        return line + b"\n"
+
+    def reset_input_buffer(self):
+        self.buffer = b""
+        self.ws.settimeout(0.2)
+        try:
+            while True:
+                self.ws.recv()  # drain pending frames
+        except Exception:
+            pass
+        self.ws.settimeout(self.timeout)
+
+    def close(self):
+        try:
+            self.ws.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+class ESP3DLink(WebSocketLink):
+    """GRBL via an ESP3D-style wifi board (the usual 3018 wifi module).
+
+    These boards take commands as HTTP GET /command?plain=<cmd> and push
+    GRBL's serial output to websocket clients on port 81 — the websocket
+    itself ignores incoming data. Confirmed against a live 3018: connecting
+    ws://host:81 yields CURRENT_ID/ACTIVE_ID/PING control frames, and $$ via
+    HTTP returns the settings dump as websocket frames ending in 'ok'."""
+
+    def __init__(self, host, timeout=8):
+        host = host.replace("http://", "").strip("/")
+        host, _, ws_port = host.partition(":")
+        super().__init__(f"ws://{host}:{ws_port or 81}", timeout=timeout)
+        self.host = host
+
+    def write(self, data):
+        if isinstance(data, bytes):
+            data = data.decode("latin-1")
+        for cmd in data.replace("\r", "\n").split("\n"):
+            if not cmd:
+                continue
+            url = (f"http://{self.host}/command?plain="
+                   f"{urllib.parse.quote(cmd, safe='')}")
+            urllib.request.urlopen(url, timeout=self.timeout).read()
+
+
+def link_kind(target):
+    """'serial' (COM3, /dev/ttyUSB0), 'ws' (ws://host:81, raw bidirectional
+    websocket GRBL like FluidNC), or 'esp3d' (bare IP / http:// address)."""
+    if target.startswith(("ws://", "wss://")):
+        return "ws"
+    if target.startswith("http://") or ("." in target and "/" not in target):
+        return "esp3d"
+    return "serial"
+
+
+def open_grbl(target, baud):
+    """Open a GRBL link — see link_kind for accepted target forms."""
+    kind = link_kind(target)
+    if kind == "ws":
+        link = WebSocketLink(target)
+    elif kind == "esp3d":
+        link = ESP3DLink(target)
+    else:
+        import serial  # pyserial; imported here so the GUI runs without it
+
+        link = serial.Serial(target, baud, timeout=5)
+        link.write(b"\r\n\r\n")  # wake GRBL
+        time.sleep(2)
+    link.reset_input_buffer()
+    return link
 
 
 def stream_gcode_serial(port, baud, lines, on_progress=None, abort=None):
@@ -795,35 +893,42 @@ def main():
     def open_machine_dialog():
         try:
             from serial.tools import list_ports
+            ports = [p.device for p in list_ports.comports()]
         except ImportError:
-            messagebox.showerror(
-                "pyserial missing",
-                "Direct machine control needs pyserial:\n\npip install pyserial",
-            )
-            return
-        ports = [p.device for p in list_ports.comports()]
-        if not ports:
-            messagebox.showerror(
-                "No serial ports",
-                "No serial ports found — is the machine connected via USB?",
-            )
-            return
+            ports = []  # pyserial missing: websocket connections still work
 
         win = Toplevel(root)
         win.title("Machine (GRBL)")
-        Label(win, text="Port:").grid(row=0, column=0, sticky="e")
-        port_var = StringVar(value=ports[0])
-        OptionMenu(win, port_var, *ports).grid(row=0, column=1, sticky="w")
-        Label(win, text="Baud:").grid(row=1, column=0, sticky="e")
+        Label(win, text="Connect to:").grid(row=0, column=0, sticky="e")
+        conn_entry = Entry(win, width=24)
+        conn_entry.insert(0, ports[0] if ports else "192.168.1.207")
+        conn_entry.grid(row=0, column=1, sticky="w")
+        if ports:
+            port_pick = StringVar(value=ports[0])
+
+            def pick_port(p):
+                conn_entry.delete(0, "end")
+                conn_entry.insert(0, p)
+
+            OptionMenu(win, port_pick, *ports, command=pick_port).grid(
+                row=0, column=2, sticky="w"
+            )
+        Label(win, text="COM port, IP address (ESP3D wifi board), or ws:// URL").grid(
+            row=1, column=1, columnspan=2, sticky="w"
+        )
+        Label(win, text="Baud (serial only):").grid(row=2, column=0, sticky="e")
         baud_entry = Entry(win, width=8)
         baud_entry.insert(0, "115200")
-        baud_entry.grid(row=1, column=1, sticky="w")
+        baud_entry.grid(row=2, column=1, sticky="w")
+
+        def conn():
+            return conn_entry.get().strip()
         dry_var = tk.BooleanVar(value=True)
         Checkbutton(
             win, text="Dry run only (boundary trace, no cutting)", variable=dry_var
-        ).grid(row=2, column=0, columnspan=2, sticky="w")
+        ).grid(row=3, column=0, columnspan=3, sticky="w")
         status = Label(win, text="Home/zero the machine first, then Send")
-        status.grid(row=3, column=0, columnspan=2, pady=4)
+        status.grid(row=4, column=0, columnspan=3, pady=4)
         abort_event = threading.Event()
         busy = [False]
 
@@ -876,7 +981,7 @@ def main():
             busy[0] = True
             set_status("Connecting…")
             threading.Thread(
-                target=send_worker, args=(port_var.get(), baud, lines), daemon=True
+                target=send_worker, args=(conn(), baud, lines), daemon=True
             ).start()
 
         def open_grbl_settings():
@@ -887,7 +992,7 @@ def main():
 
             def read_worker():
                 try:
-                    values = grbl_read_settings(port_var.get(), baud)
+                    values = grbl_read_settings(conn(), baud)
                 except Exception as exc:
                     set_status(f"Failed to read settings: {exc}")
                     return
@@ -946,7 +1051,7 @@ def main():
 
                     def write_worker():
                         try:
-                            problems = grbl_write_settings(port_var.get(), baud, changes)
+                            problems = grbl_write_settings(conn(), baud, changes)
                         except Exception as exc:
                             root.after(0, lambda: ed_status.config(text=f"Failed: {exc}"))
                             return
@@ -966,10 +1071,10 @@ def main():
 
             threading.Thread(target=read_worker, daemon=True).start()
 
-        Button(win, text="▶ Send", command=start_send).grid(row=4, column=0, pady=6)
-        Button(win, text="⛔ Abort", command=abort_event.set).grid(row=4, column=1, pady=6)
+        Button(win, text="▶ Send", command=start_send).grid(row=5, column=0, pady=6)
+        Button(win, text="⛔ Abort", command=abort_event.set).grid(row=5, column=1, pady=6)
         Button(win, text="⚙ GRBL Settings ($$)", command=open_grbl_settings).grid(
-            row=5, column=0, columnspan=2, pady=(0, 6)
+            row=6, column=0, columnspan=2, pady=(0, 6)
         )
 
     def open_settings():

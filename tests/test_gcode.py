@@ -330,6 +330,56 @@ ok""".splitlines()
         with self.assertRaises(TimeoutError):
             app.await_ok(FakeSerial([]))
 
+    def test_link_kind_classification(self):
+        self.assertEqual(app.link_kind("COM3"), "serial")
+        self.assertEqual(app.link_kind("/dev/ttyUSB0"), "serial")
+        self.assertEqual(app.link_kind("192.168.1.207"), "esp3d")
+        self.assertEqual(app.link_kind("http://192.168.1.207"), "esp3d")
+        self.assertEqual(app.link_kind("ws://192.168.1.207:81"), "ws")
+
+    def test_esp3d_write_sends_http_commands(self):
+        link = object.__new__(app.ESP3DLink)
+        link.host = "192.168.1.207"
+        link.timeout = 5
+        urls = []
+
+        class FakeResponse:
+            def read(self):
+                return b""
+
+        original = app.urllib.request.urlopen
+        app.urllib.request.urlopen = lambda url, timeout: urls.append(url) or FakeResponse()
+        try:
+            link.write(b"$$\n")
+            link.write("G1 X5 Y0 F300\n")
+            link.write(b"\r\n\r\n")  # wake noise: no commands, no requests
+        finally:
+            app.urllib.request.urlopen = original
+        self.assertEqual(urls, [
+            "http://192.168.1.207/command?plain=%24%24",
+            "http://192.168.1.207/command?plain=G1%20X5%20Y0%20F300",
+        ])
+
+    def test_websocket_readline_reassembles_frames(self):
+        link = object.__new__(app.WebSocketLink)
+        link.buffer = b""
+        link.timeout = 5
+
+        class FakeWS:
+            def __init__(self, frames):
+                self.frames = list(frames)
+
+            def recv(self):
+                if not self.frames:
+                    raise TimeoutError()
+                return self.frames.pop(0)
+
+        # One frame carrying many lines, then a partial line completed later
+        link.ws = FakeWS(["$0=10\r\n$1=5\r\nok\r\n", "<Idle|WPos", ":0,0,0>\r\n"])
+        lines = [link.readline().decode().strip() for _ in range(4)]
+        self.assertEqual(lines, ["$0=10", "$1=5", "ok", "<Idle|WPos:0,0,0>"])
+        self.assertEqual(link.readline(), b"", "timeout must read as empty like serial")
+
 
 if __name__ == "__main__":
     unittest.main()
