@@ -63,6 +63,58 @@ class TextGeometryTests(unittest.TestCase):
         )
 
 
+class LabelSizeTests(unittest.TestCase):
+    def test_fixed_size_cutout_and_centering(self):
+        layout = app.build_layout(["AB"], FONT, 8, 10, 2, 300, label_size=(60, 20))
+        item = layout[0]
+        x0, y0, x1, y1 = item["cutout"]
+        self.assertAlmostEqual(x1 - x0, 60)
+        self.assertAlmostEqual(y1 - y0, 20)
+        self.assertTrue(item["fits"])
+        # text centered inside the label box, both axes
+        self.assertAlmostEqual(item["x"] - x0, x1 - (item["x"] + item["width"]), places=6)
+        self.assertAlmostEqual(item["y_top"] - y0, y1 - (item["y_top"] + item["height"]), places=6)
+
+    def test_too_small_label_flagged(self):
+        layout = app.build_layout(["MUCH TOO LONG"], FONT, 8, 10, 2, 300, label_size=(20, 10))
+        self.assertFalse(layout[0]["fits"])
+
+    def test_auto_size_still_fits_text(self):
+        layout = app.build_layout(["AB"], FONT, 8, 10, 2, 300)
+        item = layout[0]
+        x0, y0, x1, y1 = item["cutout"]
+        self.assertAlmostEqual(x1 - x0, item["width"] + 4)
+        self.assertAlmostEqual(y1 - y0, item["height"] + 4)
+        self.assertTrue(item["fits"])
+
+
+class KerfTests(unittest.TestCase):
+    def test_spindle_toolpath_offset_by_tool_radius(self):
+        s = dict(SETTINGS, tab_width=0.0, tab_height=0.0)
+        layout = app.build_layout(
+            ["AB"], FONT, 8, 10, s["cutout_padding"], s["material_width"],
+            label_size=(60, 20),
+        )
+        g = app.generate_gcode_lines(layout, s, fill_text=False)
+        x0, _, x1, _ = layout[0]["cutout"]
+        r = s["tool_diameter"] / 2
+        xs = [x for x, _ in xy_moves(g)]
+        self.assertAlmostEqual(max(xs), x1 + r, places=3)
+        self.assertAlmostEqual(min(xs), x0 - r, places=3)
+
+    def test_laser_toolpath_offset_by_half_kerf(self):
+        s = dict(SETTINGS, tool_mode="Laser", laser_kerf=0.2)
+        layout = app.build_layout(
+            ["AB"], FONT, 8, 10, s["cutout_padding"], s["material_width"],
+            label_size=(60, 20),
+        )
+        g = app.generate_gcode_lines(layout, s, fill_text=False)
+        x0, _, x1, _ = layout[0]["cutout"]
+        xs = [x for x, _ in xy_moves(g)]
+        self.assertAlmostEqual(max(xs), x1 + 0.1, places=3)
+        self.assertAlmostEqual(min(xs), x0 - 0.1, places=3)
+
+
 class GcodeTests(unittest.TestCase):
     def layout(self, labels=("TEST",), font_height=10):
         return app.build_layout(

@@ -47,6 +47,7 @@ DEFAULT_SETTINGS = {
     "laser_power": 1000,
     "tool_mode": "Spindle",
     "cutout_padding": 2.0,
+    "laser_kerf": 0.15,
     "tab_width": 3.0,
     "tab_height": 0.4,
     "material_width": 1000,
@@ -153,31 +154,46 @@ def hatch_fill(geom, spacing):
 
 
 def build_layout(labels, font_path, font_height_mm, spacing, padding,
-                 material_width, snap_grid=None):
+                 material_width, snap_grid=None, label_size=None):
     """Place labels top-down on the material, centered horizontally.
 
     Coordinates are "canvas" mm: origin top-left, Y increases downward (what
     the preview shows). Each item's geom keeps its own origin (text bbox
     bottom-left, Y up); x/y_top place that box on the material.
+
+    label_size: (width, height) in mm for fixed-size labels, or None to size
+    each label from its text (bbox + padding). A fixed-size label whose text
+    (plus padding clearance) doesn't fit is flagged fits=False — the caller
+    decides whether to warn or refuse.
     """
     def snap(v):
         return round(v / snap_grid) * snap_grid if snap_grid else v
 
     items = []
-    y_top = 40.0
+    cursor = 40.0  # canvas y of the top edge of the next label
     for label in labels:
         geom = text_geometry(label, font_path, font_height_mm)
         if geom is None:
             continue
         _, _, width, height = geom.bounds
-        x = snap((material_width - width) / 2)
-        y_top = snap(y_top)
-        cutout = (x - padding, y_top - padding, x + width + padding, y_top + height + padding)
+        if label_size:
+            label_w, label_h = label_size
+            fits = (width + 2 * padding <= label_w + 1e-6
+                    and height + 2 * padding <= label_h + 1e-6)
+        else:
+            label_w, label_h = width + 2 * padding, height + 2 * padding
+            fits = True
+        bx0 = snap((material_width - label_w) / 2)
+        by0 = snap(cursor)
         items.append({
-            "label": label, "geom": geom, "x": x, "y_top": y_top,
-            "width": width, "height": height, "cutout": cutout,
+            "label": label, "geom": geom,
+            "x": bx0 + (label_w - width) / 2,
+            "y_top": by0 + (label_h - height) / 2,
+            "width": width, "height": height,
+            "cutout": (bx0, by0, bx0 + label_w, by0 + label_h),
+            "fits": fits,
         })
-        y_top += height + padding * 2 + spacing
+        cursor = by0 + label_h + spacing
     return items
 
 
@@ -261,9 +277,14 @@ def generate_gcode_lines(layout, settings, fill_text):
                 for ring in geom_rings(geom):
                     polyline([tuple(pt) for pt in ring], depth)
 
-        # Cutout rectangle in machine coordinates
+        # Cutout rectangle in machine coordinates, with the toolpath offset
+        # outward by half the tool/kerf width so the finished label comes out
+        # at the drawn size (the drawn rectangle is the label edge, not the
+        # tool centre).
+        r = (settings["laser_kerf"] if laser else settings["tool_diameter"]) / 2
         cx0, cy0, cx1, cy1 = item["cutout"]
-        mx0, my0, mx1, my1 = cx0, H - cy1, cx1, H - cy0
+        mx0, my0 = cx0 - r, H - cy1 - r
+        mx1, my1 = cx1 + r, H - cy0 + r
         g.append(f"(Cutout for label: {item['label']})")
         total = settings["label_cutout_depth"]
         tab_h, tab_w = settings["tab_height"], settings["tab_width"]
@@ -310,6 +331,7 @@ SETTINGS_FIELDS = [
     ("spindle_rpm", "Spindle RPM"),
     ("laser_power", "Laser Power (S value)"),
     ("cutout_padding", "Cutout Padding (mm)"),
+    ("laser_kerf", "Laser Kerf (mm)"),
     ("tab_width", "Tab Width (mm, 0 = no tabs)"),
     ("tab_height", "Tab Height (mm, 0 = no tabs)"),
     ("material_width", "Material Width (mm)"),
@@ -339,26 +361,38 @@ def main():
         "font_path": next(iter(system_fonts.values())),
     }
 
+    def parse_label_size(raw):
+        """'Auto' -> None, '60x20' -> (60.0, 20.0); raises ValueError otherwise."""
+        raw = raw.strip().lower().replace("×", "x")
+        if raw in ("", "auto"):
+            return None
+        w, h = (float(p) for p in raw.split("x"))
+        if w <= 0 or h <= 0:
+            raise ValueError(raw)
+        return (w, h)
+
     def read_inputs():
-        """Widget values -> layout inputs, or None if a number field is invalid."""
+        """Widget values -> layout inputs, or None if a field is invalid."""
         try:
             font_height = float(font_height_entry.get())
             spacing = float(spacing_entry.get())
+            label_size = parse_label_size(size_entry.get())
         except ValueError:
             return None
         text = entry.get("1.0", "end").strip()
         labels = [lbl.strip().rstrip(",") for lbl in text.splitlines() if lbl.strip()]
-        return labels, font_height, spacing
+        return labels, font_height, spacing, label_size
 
     def current_layout():
         inputs = read_inputs()
         if inputs is None:
             return None
-        labels, font_height, spacing = inputs
+        labels, font_height, spacing, label_size = inputs
         return build_layout(
             labels, state["font_path"], font_height, spacing,
             cnc_settings["cutout_padding"], cnc_settings["material_width"],
             snap_grid=SNAP_GRID_MM if snap_var.get() else None,
+            label_size=label_size,
         )
 
     def update_preview():
@@ -369,7 +403,7 @@ def main():
 
         if read_inputs() is None:
             canvas.create_text(
-                200, 40, text="Invalid font height or spacing", fill="red"
+                200, 40, text="Invalid font height, spacing or label size", fill="red"
             )
             return
         layout = current_layout()
@@ -409,34 +443,42 @@ def main():
             cx0, cy0, cx1, cy1 = item["cutout"]
             canvas.create_rectangle(
                 cx0 * zoom, cy0 * zoom, cx1 * zoom, cy1 * zoom,
-                outline="blue", dash=(2, 2),
+                outline="blue" if item["fits"] else "red", dash=(2, 2),
             )
             if cy1 > mat_h or cx0 < 0:
                 overflow = True
 
+        warnings = []
         if overflow:
+            warnings.append("labels exceed material size")
+        if any(not item["fits"] for item in layout):
+            warnings.append("text too big for label size (red)")
+        if warnings:
             canvas.create_text(
                 min(mat_w, MAX_CANVAS_W) / 2, 20,
-                text="Warning: labels exceed material size", fill="orange",
+                text="Warning: " + "; ".join(warnings), fill="orange",
             )
 
     def generate_gcode():
         if read_inputs() is None:
-            messagebox.showerror("Error", "Invalid font height or spacing")
+            messagebox.showerror("Error", "Invalid font height, spacing or label size")
             return
         layout = current_layout()
         if not layout:
             messagebox.showerror("Error", "Nothing to export — enter at least one label")
             return
-        for item in layout:
-            cx0, cy0, cx1, cy1 = item["cutout"]
-            if cy1 > cnc_settings["material_height"] or cx0 < 0:
-                if not messagebox.askyesno(
-                    "Overflow",
-                    "Labels exceed the material size. Export anyway?",
-                ):
-                    return
-                break
+        problems = []
+        if any(
+            item["cutout"][3] > cnc_settings["material_height"] or item["cutout"][0] < 0
+            for item in layout
+        ):
+            problems.append("labels exceed the material size")
+        if any(not item["fits"] for item in layout):
+            problems.append("some labels are too small for their text")
+        if problems and not messagebox.askyesno(
+            "Warning", "; ".join(problems).capitalize() + ". Export anyway?"
+        ):
+            return
 
         gcode = generate_gcode_lines(layout, cnc_settings, fill_text_var.get())
 
@@ -511,6 +553,22 @@ def main():
     spacing_entry.insert(0, "10")
     spacing_entry.grid(row=1, column=3, sticky="w")
 
+    Label(root, text="Label Size:").grid(row=1, column=4, sticky="e")
+    size_entry = Entry(root, width=8)
+    size_entry.insert(0, "Auto")
+    size_entry.grid(row=1, column=5, sticky="w")
+    size_preset = StringVar(value="Auto")
+
+    def pick_size(choice):
+        size_entry.delete(0, "end")
+        size_entry.insert(0, choice)
+        update_preview()
+
+    OptionMenu(
+        root, size_preset, "Auto", "50x15", "60x20", "75x25", "100x30",
+        command=pick_size,
+    ).grid(row=1, column=6, sticky="w")
+
     Label(root, text="Font:").grid(row=2, column=0, sticky="e")
     font_name = StringVar()
     font_name.set(next(iter(system_fonts.keys())))
@@ -545,6 +603,7 @@ def main():
     entry.bind("<KeyRelease>", lambda e: update_preview())
     font_height_entry.bind("<KeyRelease>", lambda e: update_preview())
     spacing_entry.bind("<KeyRelease>", lambda e: update_preview())
+    size_entry.bind("<KeyRelease>", lambda e: update_preview())
 
     update_preview()
     root.mainloop()

@@ -86,6 +86,7 @@ python -m unittest discover tests
 - Use one label per line (no commas needed)
 - Multi-word labels supported
 - Text is centered in each label cutout
+- **Label Size**: pick a preset (or type e.g. `60x20`) for fixed-size labels; labels whose text doesn't fit are shown in red. `Auto` sizes each label from its text
 - Toggle Grid Snap for precision
 - Mouse scroll to zoom, Reset button to restore
 
@@ -95,6 +96,8 @@ A modernized version using **TrueType fonts** for accurate rendering, cutouts, a
 - 🅰️ Uses system-installed TTF fonts (e.g., Arial, DIN)
 - ✂️ G-code generation for text + label cutouts (multi-pass, with holding tabs)
 - 📏 Font height calibrated in real millimetres (capital letter height)
+- 🏷️ Fixed label sizes (50x15, 60x20, 75x25, 100x30 or custom WxH) or auto-size from text
+- 🔧 Kerf compensation — toolpath offset by tool radius (spindle) or half kerf (laser), so finished labels match the drawn size
 - 🔍 Zoom with mouse scroll
 - 🔲 Grid snapping (toggle on/off)
 - ⚙️ Settings panel for depths, feeds, tool mode (Spindle or Laser)
@@ -124,7 +127,8 @@ When you click the **Settings** button in the GUI, you can configure and save yo
 | **Spindle RPM**        | S value sent with M3 in Spindle mode                                        |
 | **Laser Power**        | S value sent with M4 in Laser mode (GRBL dynamic power)                     |
 | **Tool Mode**          | **Spindle** (M3, Z plunges) or **Laser** (M4 dynamic power, no Z motion)    |
-| **Cutout Padding**     | Distance from text to label border in mm                                    |
+| **Cutout Padding**     | Distance from text to label border in mm (min clearance for fixed sizes)    |
+| **Laser Kerf**         | Beam kerf width in mm; cutout path is offset outward by half of it          |
 | **Tab Width/Height**   | Holding tabs left on the cutout so labels don't come loose (0 = no tabs)    |
 | **Material Width/Height** | Material size in mm (used for centering, preview and overflow warning)  |
 
