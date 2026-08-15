@@ -478,7 +478,17 @@ class WebSocketLink:
             ) from None
 
         self.timeout = timeout
-        self.ws = websocket.create_connection(url, timeout=timeout)
+        try:
+            self.ws = websocket.create_connection(url, timeout=timeout)
+        except websocket.WebSocketBadStatusException as exc:
+            # A 200/HTML answer means we hit a web server, not a websocket —
+            # typically ws://<ip> without :81, which lands on the web UI port
+            raise RuntimeError(
+                f"{url} answered as a web page, not a GRBL websocket. "
+                "For ESP3D wifi boards enter just the IP address; for raw "
+                "websocket GRBL include the port, e.g. ws://host:81 "
+                f"(status {exc.status_code})"
+            ) from None
         self.buffer = b""
 
     def write(self, data):
@@ -939,12 +949,16 @@ def main():
         Checkbutton(
             win, text="Dry run only (boundary trace, no cutting)", variable=dry_var
         ).grid(row=3, column=0, columnspan=3, sticky="w")
-        status = Label(win, text="Home/zero the machine first, then Send")
+        status = Label(win, text="Home/zero the machine first, then Send",
+                       wraplength=380, justify="left")
         status.grid(row=4, column=0, columnspan=3, pady=4)
         abort_event = threading.Event()
         busy = [False]
 
         def set_status(text):
+            text = str(text)
+            if len(text) > 300:
+                text = text[:300] + "…"
             root.after(0, lambda: status.config(text=text))
 
         def get_baud():
@@ -1040,7 +1054,8 @@ def main():
                     Label(inner, text=desc, anchor="w").grid(row=row, column=2, sticky="w")
                     entries[num] = e
 
-                ed_status = Label(ed, text=f"{len(values)} settings read")
+                ed_status = Label(ed, text=f"{len(values)} settings read",
+                                  wraplength=380, justify="left")
                 ed_status.grid(row=1, column=0, columnspan=2)
 
                 def write_changes():
