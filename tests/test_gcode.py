@@ -102,6 +102,18 @@ class KerfTests(unittest.TestCase):
         self.assertAlmostEqual(max(xs), x1 + r, places=3)
         self.assertAlmostEqual(min(xs), x0 - r, places=3)
 
+    def test_work_origin_offset_shifts_all_moves(self):
+        layout = app.build_layout(
+            ["AB"], FONT, 8, 10, SETTINGS["cutout_padding"], SETTINGS["material_width"],
+        )
+        base = xy_moves(app.generate_gcode_lines(layout, SETTINGS, fill_text=False))
+        s = dict(SETTINGS, offset_x=25.0, offset_y=-10.0)
+        shifted = xy_moves(app.generate_gcode_lines(layout, s, fill_text=False))
+        self.assertEqual(len(base), len(shifted))
+        for (bx, by), (sx_, sy_) in zip(base, shifted):
+            self.assertAlmostEqual(sx_ - bx, 25.0, places=3)
+            self.assertAlmostEqual(sy_ - by, -10.0, places=3)
+
     def test_laser_toolpath_offset_by_half_kerf(self):
         s = dict(SETTINGS, tool_mode="Laser", laser_kerf=0.2)
         layout = app.build_layout(

@@ -41,6 +41,8 @@ DEFAULT_SETTINGS = {
     "pass_depth": 0.4,
     "tool_diameter": 0.3,
     "safe_z": 5.0,
+    "offset_x": 0.0,
+    "offset_y": 0.0,
     "feed_rate": 300,
     "plunge_rate": 100,
     "spindle_rpm": 10000,
@@ -248,15 +250,18 @@ def generate_gcode_lines(layout, settings, fill_text):
         g.append(f"M3 S{settings['spindle_rpm']:.0f} ; spindle on")
         g.append("G4 P2 ; wait for spindle to reach speed")
 
+    # Work-origin offset: shifts the whole job away from machine home
+    ox, oy = settings["offset_x"], settings["offset_y"]
+
     def polyline(points, depth):
         sx, sy = points[0]
-        g.append(f"G0 X{sx:.3f} Y{sy:.3f}")
+        g.append(f"G0 X{sx + ox:.3f} Y{sy + oy:.3f}")
         if not laser:
             g.append(f"G1 Z{-depth:.3f} F{plunge:.0f}")
         first = True
         for px, py in points[1:]:
             f_part = f" F{feed:.0f}" if first else ""
-            g.append(f"G1 X{px:.3f} Y{py:.3f}{f_part}")
+            g.append(f"G1 X{px + ox:.3f} Y{py + oy:.3f}{f_part}")
             first = False
         if not laser:
             g.append(f"G0 Z{safe_z:.3f}")
@@ -326,6 +331,8 @@ SETTINGS_FIELDS = [
     ("pass_depth", "Depth per Pass (mm)"),
     ("tool_diameter", "Tool Diameter (mm)"),
     ("safe_z", "Safe Z Height (mm)"),
+    ("offset_x", "X Offset from Home (mm)"),
+    ("offset_y", "Y Offset from Home (mm)"),
     ("feed_rate", "Feed Rate (mm/min)"),
     ("plunge_rate", "Plunge Rate (mm/min)"),
     ("spindle_rpm", "Spindle RPM"),
@@ -339,7 +346,7 @@ SETTINGS_FIELDS = [
 ]
 
 SNAP_GRID_MM = 5
-MAX_CANVAS_W, MAX_CANVAS_H = 1200, 700
+CANVAS_W, CANVAS_H = 900, 550
 
 
 def main():
@@ -397,9 +404,7 @@ def main():
 
     def update_preview():
         canvas.delete("all")
-        zoom = state["zoom"]
         mat_w, mat_h = cnc_settings["material_width"], cnc_settings["material_height"]
-        canvas.config(width=min(mat_w, MAX_CANVAS_W), height=min(mat_h, MAX_CANVAS_H))
 
         if read_inputs() is None:
             canvas.create_text(
@@ -408,19 +413,38 @@ def main():
             return
         layout = current_layout()
 
-        # Material boundary
-        canvas.create_rectangle(0, 0, mat_w * zoom, mat_h * zoom, outline="gray")
+        # World (mm) -> screen (px): fit the whole material sheet into the
+        # canvas at zoom 1, and zoom about the canvas centre so content stays
+        # in view.
+        scale = min(CANVAS_W / mat_w, CANVAS_H / mat_h) * 0.95 * state["zoom"]
+
+        def sx(wx):
+            return (wx - mat_w / 2) * scale + CANVAS_W / 2
+
+        def sy(wy):
+            return (wy - mat_h / 2) * scale + CANVAS_H / 2
+
+        # Material boundary and work zero (machine origin = bottom-left)
+        canvas.create_rectangle(sx(0), sy(0), sx(mat_w), sy(mat_h), outline="gray")
+        zx, zy = sx(0), sy(mat_h)
+        canvas.create_line(zx - 8, zy, zx + 8, zy, fill="green")
+        canvas.create_line(zx, zy - 8, zx, zy + 8, fill="green")
+        ox, oy = cnc_settings["offset_x"], cnc_settings["offset_y"]
+        origin_label = "X0 Y0" if not (ox or oy) else f"job at X{ox:g} Y{oy:g}"
+        canvas.create_text(zx + 6, zy + 12, text=origin_label, fill="green", anchor="w")
 
         overflow = False
         for item in layout:
             x, y_top, height = item["x"], item["y_top"], item["height"]
 
             # geom is Y-up with origin at the text bbox bottom-left; the canvas
-            # is Y-down, so: canvas_y = y_top + height - geom_y
+            # is Y-down, so: world_y = y_top + height - geom_y
             def to_canvas(coords):
                 pts = np.asarray(coords, dtype=float).copy()
-                pts[:, 0] = (pts[:, 0] + x) * zoom
-                pts[:, 1] = (y_top + height - pts[:, 1]) * zoom
+                wx = pts[:, 0] + x
+                wy = y_top + height - pts[:, 1]
+                pts[:, 0] = (wx - mat_w / 2) * scale + CANVAS_W / 2
+                pts[:, 1] = (wy - mat_h / 2) * scale + CANVAS_H / 2
                 return pts
 
             if fill_text_var.get():
@@ -442,7 +466,7 @@ def main():
 
             cx0, cy0, cx1, cy1 = item["cutout"]
             canvas.create_rectangle(
-                cx0 * zoom, cy0 * zoom, cx1 * zoom, cy1 * zoom,
+                sx(cx0), sy(cy0), sx(cx1), sy(cy1),
                 outline="blue" if item["fits"] else "red", dash=(2, 2),
             )
             if cy1 > mat_h or cx0 < 0:
@@ -455,7 +479,7 @@ def main():
             warnings.append("text too big for label size (red)")
         if warnings:
             canvas.create_text(
-                min(mat_w, MAX_CANVAS_W) / 2, 20,
+                CANVAS_W / 2, 15,
                 text="Warning: " + "; ".join(warnings), fill="orange",
             )
 
@@ -512,7 +536,8 @@ def main():
             except ValueError:
                 messagebox.showerror("Error", "All settings must be numbers")
                 return
-            for key in ("pass_depth", "safe_z", "feed_rate", "plunge_rate"):
+            for key in ("pass_depth", "safe_z", "feed_rate", "plunge_rate",
+                        "material_width", "material_height"):
                 if new_values[key] <= 0:
                     messagebox.showerror("Error", f"{key} must be greater than zero")
                     return
@@ -589,12 +614,7 @@ def main():
         row=2, column=6
     )
 
-    canvas = Canvas(
-        root,
-        width=min(cnc_settings["material_width"], MAX_CANVAS_W),
-        height=min(cnc_settings["material_height"], MAX_CANVAS_H),
-        bg="white",
-    )
+    canvas = Canvas(root, width=CANVAS_W, height=CANVAS_H, bg="white")
     canvas.grid(row=3, column=0, columnspan=7, pady=10)
 
     canvas.bind("<MouseWheel>", lambda e: zoom_canvas(e.delta))

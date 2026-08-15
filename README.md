@@ -88,7 +88,8 @@ python -m unittest discover tests
 - Text is centered in each label cutout
 - **Label Size**: pick a preset (or type e.g. `60x20`) for fixed-size labels; labels whose text doesn't fit are shown in red. `Auto` sizes each label from its text
 - Toggle Grid Snap for precision
-- Mouse scroll to zoom, Reset button to restore
+- Mouse scroll to zoom (centred, display-only), Reset button to restore
+- The preview always fits the whole material sheet; the green cross marks work zero (X0 Y0)
 
 A modernized version using **TrueType fonts** for accurate rendering, cutouts, and export.
 
@@ -122,6 +123,7 @@ When you click the **Settings** button in the GUI, you can configure and save yo
 | **Depth per Pass**     | Maximum depth removed per pass; deeper cuts are split into multiple passes  |
 | **Tool Diameter**      | Diameter of your engraving tool (sets hatch-fill line spacing)              |
 | **Safe Z Height**      | The safe height (Z-axis) to lift to before rapid movement (e.g., 5.0mm)     |
+| **X/Y Offset from Home** | Work-origin offset added to every exported coordinate, to shift the job away from machine home |
 | **Feed Rate**          | Speed of cutting movement in mm/min (e.g., 300)                             |
 | **Plunge Rate**        | Speed of Z plunges in mm/min (e.g., 100)                                    |
 | **Spindle RPM**        | S value sent with M3 in Spindle mode                                        |
