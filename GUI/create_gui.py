@@ -1235,7 +1235,6 @@ def main():
     Button(root, text="🔄 Reset Zoom", command=reset_zoom).grid(row=2, column=3)
     Button(root, text="💾 Export G-code", command=generate_gcode).grid(row=2, column=4)
     Button(root, text="🧭 Dry Run", command=export_dry_run).grid(row=2, column=5)
-    Button(root, text="📡 Machine", command=open_machine_dialog).grid(row=2, column=9)
 
     snap_var = tk.BooleanVar(value=False)
     Checkbutton(root, text="Snap to Grid", variable=snap_var, command=update_preview).grid(
@@ -1251,7 +1250,7 @@ def main():
     )
 
     canvas = Canvas(root, width=CANVAS_W, height=CANVAS_H, bg="white")
-    canvas.grid(row=3, column=0, columnspan=10, pady=10)
+    canvas.grid(row=3, column=0, columnspan=9, pady=10)
 
     canvas.bind("<MouseWheel>", lambda e: zoom_canvas(e.delta, e.x, e.y))
     canvas.bind("<Button-4>", lambda e: zoom_canvas(120, e.x, e.y))
