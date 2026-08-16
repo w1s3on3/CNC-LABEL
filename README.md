@@ -172,7 +172,8 @@ The **📡 Machine** button talks to a GRBL 1.1 controller directly, over any of
 - **Home ($H) before send** is ticked by default: the machine runs its homing cycle first, and nothing is streamed unless homing succeeds (untick it if your machine has no homing switches / `$22=0`)
 - **Dry run only** is ticked by default — the first send traces the job boundary at Safe Z / Frame Power so you can check placement before cutting anything
 - Streaming is call-and-response (each line waits for GRBL's `ok`), with live progress and an **Abort** button that feed-holds (`!`) and soft-resets (`Ctrl-X`) the controller
-- **Home/zero the machine first** — the app sends the job as-is against your current work zero
+- **Jog / Set Work Zero panel**: arrow buttons jog X/Y/Z by a chosen step (via GRBL's `$J` interface, so soft limits still protect you), with a live position readout. Put the tool on the board's bottom-left corner and press **Set X0 Y0 here** (`G10 L20 P1` — survives reset) — that corner becomes the job's X0 Y0. **Set Z0 here** does the same for the tool touching the material surface
+- The dialog keeps one connection open while it's in use, so jogging is responsive; closing the dialog disconnects
 
 ### ⚙ GRBL Settings ($$)
 

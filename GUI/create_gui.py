@@ -662,65 +662,114 @@ def home_machine(ser, timeout_s=90):
     raise TimeoutError(f"homing did not complete within {timeout_s}s")
 
 
-def stream_gcode_serial(port, baud, lines, on_progress=None, abort=None, home=False):
+def stream_gcode(ser, lines, on_progress=None, abort=None, home=False):
     """Stream a job to GRBL call-and-response style (send a line, wait for
-    ok). Simple and reliable for label-sized jobs. Returns (sent, errors).
-    Setting the abort event feed-holds then soft-resets the controller.
-    With home=True, a $H homing cycle runs first — nothing is streamed
-    unless it succeeds."""
+    ok) over an already-open link. Returns (sent, errors). Setting the abort
+    event feed-holds then soft-resets the controller. With home=True, a $H
+    homing cycle runs first — nothing is streamed unless it succeeds."""
     cmds = sendable_lines(lines)
     errors = 0
-    with open_grbl(port, baud) as ser:
-        if home:
-            err = home_machine(ser)
-            if err:
-                raise RuntimeError(f"homing failed ({err}) — nothing was sent")
-        app_log(f"Streaming {len(cmds)} lines")
-        for i, cmd in enumerate(cmds, 1):
-            if abort is not None and abort.is_set():
-                app_log("ABORT: feed hold + soft reset")
-                ser.write(b"!")        # feed hold
-                time.sleep(0.2)
-                ser.write(b"\x18")     # soft reset: abandon the job
-                return i - 1, errors
-            app_log(f"TX {cmd}")
-            ser.write((cmd + "\n").encode("ascii"))
-            if await_ok(ser, f"at line {i} ({cmd!r})"):
-                errors += 1
-            if on_progress:
-                on_progress(i, len(cmds))
+    if home:
+        err = home_machine(ser)
+        if err:
+            raise RuntimeError(f"homing failed ({err}) — nothing was sent")
+    app_log(f"Streaming {len(cmds)} lines")
+    for i, cmd in enumerate(cmds, 1):
+        if abort is not None and abort.is_set():
+            app_log("ABORT: feed hold + soft reset")
+            ser.write(b"!")        # feed hold
+            time.sleep(0.2)
+            ser.write(b"\x18")     # soft reset: abandon the job
+            return i - 1, errors
+        app_log(f"TX {cmd}")
+        ser.write((cmd + "\n").encode("ascii"))
+        if await_ok(ser, f"at line {i} ({cmd!r})"):
+            errors += 1
+        if on_progress:
+            on_progress(i, len(cmds))
     return len(cmds), errors
 
 
-def grbl_read_settings(port, baud):
-    """Query $$ and return {number: value_string}."""
-    with open_grbl(port, baud) as ser:
-        app_log("TX $$")
-        ser.write(b"$$\n")
-        lines = []
-        while True:
-            resp = ser.readline().decode(errors="ignore").strip()
-            if resp == "ok":
-                break
-            if not resp:
-                raise TimeoutError("no response to $$")
-            app_log(f"RX {resp}")
-            lines.append(resp)
+def read_grbl_settings(ser):
+    """Query $$ over an open link and return {number: value_string}."""
+    app_log("TX $$")
+    ser.write(b"$$\n")
+    lines = []
+    while True:
+        resp = ser.readline().decode(errors="ignore").strip()
+        if resp == "ok":
+            break
+        if not resp:
+            raise TimeoutError("no response to $$")
+        app_log(f"RX {resp}")
+        lines.append(resp)
     return parse_grbl_settings(lines)
 
 
-def grbl_write_settings(port, baud, changes):
-    """Write {number: value_string} as $n=value commands. Returns a list of
-    GRBL error strings (empty = all accepted)."""
+def write_grbl_settings(ser, changes):
+    """Write {number: value_string} as $n=value commands over an open link.
+    Returns a list of GRBL error strings (empty = all accepted)."""
     problems = []
-    with open_grbl(port, baud) as ser:
-        for num, val in sorted(changes.items()):
-            app_log(f"TX ${num}={val}")
-            ser.write(f"${num}={val}\n".encode("ascii"))
-            err = await_ok(ser, f"writing ${num}")
-            if err:
-                problems.append(f"${num}={val}: {err}")
+    for num, val in sorted(changes.items()):
+        app_log(f"TX ${num}={val}")
+        ser.write(f"${num}={val}\n".encode("ascii"))
+        err = await_ok(ser, f"writing ${num}")
+        if err:
+            problems.append(f"${num}={val}: {err}")
     return problems
+
+
+def jog(ser, dx=0, dy=0, dz=0, feed=1500):
+    """Relative jog via GRBL's $J interface. Returns None or the GRBL error
+    (e.g. error:15 when a soft limit would be exceeded)."""
+    parts = "".join(f" {axis}{val:g}" for axis, val in
+                    (("X", dx), ("Y", dy), ("Z", dz)) if val)
+    if not parts:
+        return None
+    cmd = f"$J=G91 G21 F{feed:g}{parts}"
+    app_log(f"TX {cmd}")
+    ser.write((cmd + "\n").encode("ascii"))
+    return await_ok(ser, "jogging")
+
+
+def set_work_zero(ser, axes="XY"):
+    """Make the current position the work zero for the given axes
+    (G10 L20 P1 — sets the G54 offset, survives reset)."""
+    cmd = "G10 L20 P1 " + " ".join(f"{a}0" for a in axes)
+    app_log(f"TX {cmd}")
+    ser.write((cmd + "\n").encode("ascii"))
+    return await_ok(ser, "setting work zero")
+
+
+def query_status(ser):
+    """Ask for a realtime status report and return the raw '<...>' string,
+    or None if none arrives in time."""
+    ser.write(b"?")
+    end = time.time() + 3
+    while time.time() < end:
+        resp = ser.readline().decode(errors="ignore").strip()
+        if resp.startswith("<"):
+            app_log(f"RX {resp}")
+            return resp
+        if not resp:
+            break
+    return None
+
+
+# Back-compat wrappers that manage their own connection
+def stream_gcode_serial(port, baud, lines, **kwargs):
+    with open_grbl(port, baud) as ser:
+        return stream_gcode(ser, lines, **kwargs)
+
+
+def grbl_read_settings(port, baud):
+    with open_grbl(port, baud) as ser:
+        return read_grbl_settings(ser)
+
+
+def grbl_write_settings(port, baud, changes):
+    with open_grbl(port, baud) as ser:
+        return write_grbl_settings(ser, changes)
 
 
 # ---------------------------------------------------------------------------
@@ -1101,7 +1150,8 @@ def main():
                        wraplength=380, justify="left")
         status.grid(row=4, column=0, columnspan=3, pady=4)
         abort_event = threading.Event()
-        busy = [False]
+        machine_lock = threading.Lock()
+        link_holder = {"link": None}
 
         def set_status(text):
             text = str(text)
@@ -1117,10 +1167,65 @@ def main():
                 messagebox.showerror("Error", "Baud must be a number")
                 return None
 
-        def send_worker(port, baud, lines, home):
-            try:
-                sent, errors = stream_gcode_serial(
-                    port, baud, lines,
+        def drop_link():
+            if link_holder["link"] is not None:
+                try:
+                    link_holder["link"].close()
+                except Exception:
+                    pass
+                link_holder["link"] = None
+
+        win.protocol("WM_DELETE_WINDOW", lambda: (drop_link(), win.destroy()))
+
+        def machine_action(fn):
+            """Run fn(open_link) on a worker thread. One shared connection is
+            kept for the dialog's lifetime; a lock stops overlapping ops."""
+            baud = get_baud()
+            if baud is None:
+                return
+            target = conn()
+            remember_connection()
+
+            def worker():
+                if not machine_lock.acquire(blocking=False):
+                    set_status("Busy — wait for the current operation to finish")
+                    return
+                try:
+                    if link_holder["link"] is None:
+                        set_status(f"Connecting to {target}…")
+                        link_holder["link"] = open_grbl(target, baud)
+                    fn(link_holder["link"])
+                except Exception as exc:
+                    drop_link()
+                    set_status(f"Failed: {exc}")
+                finally:
+                    machine_lock.release()
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def show_position(ser):
+            report = query_status(ser)
+            if report:
+                root.after(0, lambda: pos_label.config(text=report))
+
+        def start_send():
+            if read_inputs() is None:
+                messagebox.showerror("Error", "Invalid font height, spacing or label size")
+                return
+            layout = current_layout()
+            if not layout:
+                messagebox.showerror("Error", "Nothing to send — enter at least one label")
+                return
+            lines = (
+                generate_dry_run_lines(layout, cnc_settings) if dry_var.get()
+                else generate_gcode_lines(layout, cnc_settings, fill_text_var.get())
+            )
+            home = home_var.get()
+            abort_event.clear()
+
+            def do_send(ser):
+                sent, errors = stream_gcode(
+                    ser, lines,
                     on_progress=lambda i, n: set_status(f"Sending… {i}/{n}"),
                     abort=abort_event, home=home,
                 )
@@ -1130,50 +1235,14 @@ def main():
                     set_status(f"Finished with {errors} GRBL errors — check the machine")
                 else:
                     set_status(f"Done — {sent} lines sent")
-            except Exception as exc:
-                set_status(f"Failed: {exc}")
-            finally:
-                busy[0] = False
 
-        def start_send():
-            if busy[0]:
-                return
-            if read_inputs() is None:
-                messagebox.showerror("Error", "Invalid font height, spacing or label size")
-                return
-            layout = current_layout()
-            if not layout:
-                messagebox.showerror("Error", "Nothing to send — enter at least one label")
-                return
-            baud = get_baud()
-            if baud is None:
-                return
-            remember_connection()
-            lines = (
-                generate_dry_run_lines(layout, cnc_settings) if dry_var.get()
-                else generate_gcode_lines(layout, cnc_settings, fill_text_var.get())
-            )
-            abort_event.clear()
-            busy[0] = True
-            set_status("Connecting…")
-            threading.Thread(
-                target=send_worker,
-                args=(conn(), baud, lines, home_var.get()), daemon=True,
-            ).start()
+            machine_action(do_send)
 
         def open_grbl_settings():
-            baud = get_baud()
-            if baud is None:
-                return
-            remember_connection()
             set_status("Reading $$ settings…")
 
-            def read_worker():
-                try:
-                    values = grbl_read_settings(conn(), baud)
-                except Exception as exc:
-                    set_status(f"Failed to read settings: {exc}")
-                    return
+            def do_read(ser):
+                values = read_grbl_settings(ser)
                 set_status("Settings loaded")
                 root.after(0, lambda: build_editor(values))
 
@@ -1228,12 +1297,8 @@ def main():
                         return
                     ed_status.config(text="Writing…")
 
-                    def write_worker():
-                        try:
-                            problems = grbl_write_settings(conn(), baud, changes)
-                        except Exception as exc:
-                            root.after(0, lambda: ed_status.config(text=f"Failed: {exc}"))
-                            return
+                    def do_write(ser):
+                        problems = write_grbl_settings(ser, changes)
                         if problems:
                             msg = "; ".join(problems)
                         else:
@@ -1242,7 +1307,7 @@ def main():
                                 values[num] = val
                         root.after(0, lambda: ed_status.config(text=msg))
 
-                    threading.Thread(target=write_worker, daemon=True).start()
+                    machine_action(do_write)
 
                 def save_to_file():
                     path = filedialog.asksaveasfilename(
@@ -1291,13 +1356,70 @@ def main():
                     row=3, column=1, pady=6
                 )
 
-            threading.Thread(target=read_worker, daemon=True).start()
+            machine_action(do_read)
 
         Button(win, text="▶ Send", command=start_send).grid(row=5, column=0, pady=6)
         Button(win, text="⛔ Abort", command=abort_event.set).grid(row=5, column=1, pady=6)
         Button(win, text="⚙ GRBL Settings ($$)", command=open_grbl_settings).grid(
             row=6, column=0, columnspan=2, pady=(0, 6)
         )
+
+        # --- jog / zero panel: put the board where you want it, then make
+        # its corner the job's X0 Y0 ---
+        jog_frame = tk.LabelFrame(win, text="Jog / Set Work Zero")
+        jog_frame.grid(row=7, column=0, columnspan=3, padx=8, pady=(0, 8), sticky="we")
+
+        step_var = StringVar(value="10")
+        Label(jog_frame, text="Step (mm):").grid(row=0, column=3, sticky="e")
+        OptionMenu(jog_frame, step_var, "0.1", "1", "10", "50").grid(
+            row=0, column=4, sticky="w"
+        )
+
+        def jog_action(dx=0, dy=0, dz=0):
+            step = float(step_var.get())
+
+            def fn(ser):
+                err = jog(ser, dx * step, dy * step, dz * step)
+                if err:
+                    set_status(f"GRBL: {err} (soft limit?)")
+                show_position(ser)
+
+            machine_action(fn)
+
+        def zero_action(axes):
+            def fn(ser):
+                err = set_work_zero(ser, axes)
+                set_status(f"Work zero set ({axes})" if not err else f"GRBL: {err}")
+                show_position(ser)
+
+            machine_action(fn)
+
+        def home_action():
+            def fn(ser):
+                err = home_machine(ser)
+                set_status("Homed" if not err else f"Homing failed: {err}")
+                show_position(ser)
+
+            machine_action(fn)
+
+        Button(jog_frame, text="Y+", width=4, command=lambda: jog_action(dy=1)).grid(row=0, column=1)
+        Button(jog_frame, text="X−", width=4, command=lambda: jog_action(dx=-1)).grid(row=1, column=0)
+        Button(jog_frame, text="X+", width=4, command=lambda: jog_action(dx=1)).grid(row=1, column=2)
+        Button(jog_frame, text="Y−", width=4, command=lambda: jog_action(dy=-1)).grid(row=2, column=1)
+        Button(jog_frame, text="Z+", width=4, command=lambda: jog_action(dz=1)).grid(row=1, column=3)
+        Button(jog_frame, text="Z−", width=4, command=lambda: jog_action(dz=-1)).grid(row=1, column=4)
+        Button(jog_frame, text="⌂ Home", command=home_action).grid(row=2, column=0)
+
+        Button(jog_frame, text="Set X0 Y0 here",
+               command=lambda: zero_action("XY")).grid(row=3, column=0, columnspan=2, pady=4)
+        Button(jog_frame, text="Set Z0 here",
+               command=lambda: zero_action("Z")).grid(row=3, column=2, columnspan=2, pady=4)
+        Button(jog_frame, text="⟳ Position",
+               command=lambda: machine_action(show_position)).grid(row=3, column=4, pady=4)
+
+        pos_label = Label(jog_frame, text="position unknown — press ⟳",
+                          wraplength=380, justify="left")
+        pos_label.grid(row=4, column=0, columnspan=5, sticky="w")
 
     def show_about():
         messagebox.showinfo(
