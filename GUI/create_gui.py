@@ -60,6 +60,8 @@ DEFAULT_SETTINGS = {
     "tab_height": 0.4,
     "material_width": 1000,
     "material_height": 600,
+    "machine_target": "",   # last-used machine connection (COM port / IP / ws URL)
+    "machine_baud": 115200,
 }
 
 cnc_settings = DEFAULT_SETTINGS.copy()
@@ -556,7 +558,7 @@ class ESP3DLink(WebSocketLink):
     HTTP returns the settings dump as websocket frames ending in 'ok'."""
 
     def __init__(self, host, timeout=8):
-        host = host.replace("http://", "").strip("/")
+        host = re.sub(r"^https?://", "", host).strip("/")
         host, _, ws_port = host.partition(":")
         super().__init__(f"ws://{host}:{ws_port or 81}", timeout=timeout)
         self.host = host
@@ -572,18 +574,28 @@ class ESP3DLink(WebSocketLink):
             urllib.request.urlopen(url, timeout=self.timeout).read()
 
 
+def normalize_target(target):
+    """Forgive sloppy URLs: 'ws:host:81' or 'ws:/host' -> 'ws://host:81'."""
+    t = target.strip()
+    m = re.match(r"^(wss?|https?):/{0,2}(.+)$", t, re.IGNORECASE)
+    if m:
+        return f"{m.group(1).lower()}://{m.group(2)}"
+    return t
+
+
 def link_kind(target):
     """'serial' (COM3, /dev/ttyUSB0), 'ws' (ws://host:81, raw bidirectional
     websocket GRBL like FluidNC), or 'esp3d' (bare IP / http:// address)."""
     if target.startswith(("ws://", "wss://")):
         return "ws"
-    if target.startswith("http://") or ("." in target and "/" not in target):
+    if target.startswith(("http://", "https://")) or ("." in target and "/" not in target):
         return "esp3d"
     return "serial"
 
 
 def open_grbl(target, baud):
     """Open a GRBL link — see link_kind for accepted target forms."""
+    target = normalize_target(target)
     kind = link_kind(target)
     if kind == "ws":
         app_log(f"Opening websocket {target}")
@@ -1017,7 +1029,10 @@ def main():
         win.title("Machine (GRBL)")
         Label(win, text="Connect to:").grid(row=0, column=0, sticky="e")
         conn_entry = Entry(win, width=24)
-        conn_entry.insert(0, ports[0] if ports else "192.168.1.207")
+        conn_entry.insert(
+            0, cnc_settings.get("machine_target")
+            or (ports[0] if ports else "192.168.1.207")
+        )
         conn_entry.grid(row=0, column=1, sticky="w")
         if ports:
             port_pick = StringVar(value=ports[0])
@@ -1034,11 +1049,20 @@ def main():
         )
         Label(win, text="Baud (serial only):").grid(row=2, column=0, sticky="e")
         baud_entry = Entry(win, width=8)
-        baud_entry.insert(0, "115200")
+        baud_entry.insert(0, str(cnc_settings.get("machine_baud", 115200)))
         baud_entry.grid(row=2, column=1, sticky="w")
 
         def conn():
             return conn_entry.get().strip()
+
+        def remember_connection():
+            """Persist the connection so it's prefilled next session."""
+            cnc_settings["machine_target"] = conn()
+            try:
+                cnc_settings["machine_baud"] = int(baud_entry.get())
+            except ValueError:
+                pass
+            save_settings()
         dry_var = tk.BooleanVar(value=True)
         Checkbutton(
             win, text="Dry run only (boundary trace, no cutting)", variable=dry_var
@@ -1094,6 +1118,7 @@ def main():
             baud = get_baud()
             if baud is None:
                 return
+            remember_connection()
             lines = (
                 generate_dry_run_lines(layout, cnc_settings) if dry_var.get()
                 else generate_gcode_lines(layout, cnc_settings, fill_text_var.get())
@@ -1109,6 +1134,7 @@ def main():
             baud = get_baud()
             if baud is None:
                 return
+            remember_connection()
             set_status("Reading $$ settings…")
 
             def read_worker():
@@ -1187,8 +1213,51 @@ def main():
 
                     threading.Thread(target=write_worker, daemon=True).start()
 
+                def save_to_file():
+                    path = filedialog.asksaveasfilename(
+                        parent=ed, defaultextension=".txt",
+                        initialfile="grbl_settings_backup.txt",
+                        filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+                    )
+                    if not path:
+                        return
+                    with open(path, "w") as f:
+                        f.write("\n".join(
+                            f"${n}={entries[n].get().strip()}" for n in sorted(entries)
+                        ) + "\n")
+                    app_log(f"GRBL settings backed up to {path}")
+                    ed_status.config(text=f"Saved {len(entries)} settings to file")
+
+                def load_from_file():
+                    path = filedialog.askopenfilename(
+                        parent=ed,
+                        filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+                    )
+                    if not path:
+                        return
+                    with open(path) as f:
+                        loaded = parse_grbl_settings(f.read().splitlines())
+                    changed = 0
+                    for num, val in loaded.items():
+                        if num in entries and entries[num].get().strip() != val:
+                            entries[num].delete(0, "end")
+                            entries[num].insert(0, val)
+                            changed += 1
+                    app_log(f"Loaded {len(loaded)} settings from {path}; "
+                            f"{changed} differ from the controller")
+                    ed_status.config(
+                        text=f"File loaded: {changed} value(s) differ — "
+                             "review, then Write Changes"
+                    )
+
                 Button(ed, text="💾 Write Changes", command=write_changes).grid(
-                    row=2, column=0, columnspan=2, pady=6
+                    row=2, column=0, columnspan=2, pady=(6, 0)
+                )
+                Button(ed, text="📄 Save to File…", command=save_to_file).grid(
+                    row=3, column=0, pady=6
+                )
+                Button(ed, text="📂 Load from File…", command=load_from_file).grid(
+                    row=3, column=1, pady=6
                 )
 
             threading.Thread(target=read_worker, daemon=True).start()

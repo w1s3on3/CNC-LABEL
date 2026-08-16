@@ -337,6 +337,19 @@ ok""".splitlines()
         self.assertEqual(app.link_kind("http://192.168.1.207"), "esp3d")
         self.assertEqual(app.link_kind("ws://192.168.1.207:81"), "ws")
 
+    def test_normalize_target_forgives_missing_slashes(self):
+        self.assertEqual(
+            app.normalize_target("ws:192.168.1.207:81"), "ws://192.168.1.207:81"
+        )
+        self.assertEqual(
+            app.normalize_target("ws:/192.168.1.207:81"), "ws://192.168.1.207:81"
+        )
+        self.assertEqual(
+            app.normalize_target(" WS://192.168.1.207:81 "), "ws://192.168.1.207:81"
+        )
+        self.assertEqual(app.normalize_target("COM5"), "COM5")
+        self.assertEqual(app.normalize_target("192.168.1.207"), "192.168.1.207")
+
     def test_esp3d_write_sends_http_commands(self):
         link = object.__new__(app.ESP3DLink)
         link.host = "192.168.1.207"
