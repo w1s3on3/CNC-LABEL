@@ -52,7 +52,6 @@ DEFAULT_SETTINGS = {
     "plunge_rate": 100,
     "spindle_rpm": 10000,
     "laser_power": 1000,
-    "frame_power": 5.0,
     "tool_mode": "Spindle",
     "cutout_padding": 2.0,
     "laser_kerf": 0.15,
@@ -369,13 +368,12 @@ def simulate_gcode(lines):
 
 
 def generate_dry_run_lines(layout, settings):
-    """Trace the job's outer boundary without cutting anything.
+    """Trace the job's outer boundary with the tool completely OFF.
 
-    Spindle mode: moves at Safe Z with the spindle off, so you can watch the
-    machine trace the job outline and check placement/clamp clearance.
-    Laser mode: traces at Frame Power (a very low S value) with no Z motion,
-    so the spot is visible while framing.
-    """
+    No M3/M4 is ever emitted — a dry run must not fire a spindle or laser.
+    Spindle mode additionally lifts to Safe Z first; laser mode stays put in
+    Z as usual. Watch the machine trace the outline to check placement and
+    clamp clearance."""
     if not layout:
         return []
     H = settings["material_height"]
@@ -388,21 +386,19 @@ def generate_dry_run_lines(layout, settings):
     x1 = max(i["cutout"][2] for i in layout) + r + ox
     y0 = H - max(i["cutout"][3] for i in layout) - r + oy
     y1 = H - min(i["cutout"][1] for i in layout) + r + oy
+    app_log(f"Dry run boundary: X{x0:.1f}..{x1:.1f} Y{y0:.1f}..{y1:.1f} (work coords)")
 
     g = [
         "G21 ; units: mm",
         "G90 ; absolute positioning",
-        "(Dry run: job boundary trace only - no cutting)",
+        "(Dry run: job boundary trace only - no cutting, no tool power)",
+        "M5 ; make sure spindle/laser is off",
     ]
-    if laser:
-        g.append(f"M4 S{settings['frame_power']:.0f} ; laser at frame power")
-    else:
-        g.append("M5 ; spindle off")
+    if not laser:
         g.append(f"G0 Z{settings['safe_z']:.3f} ; stay at safe height")
     g.append(f"G0 X{x0:.3f} Y{y0:.3f}")
     for px, py in [(x1, y0), (x1, y1), (x0, y1), (x0, y0)]:
         g.append(f"G1 X{px:.3f} Y{py:.3f} F{settings['feed_rate']:.0f}")
-    g.append("M5")
     g.append("M2 ; end program")
     return g
 
@@ -464,10 +460,18 @@ def parse_grbl_settings(lines):
     return out
 
 
-def await_ok(ser, context=""):
+def await_ok(ser, context="", timeout_s=120, abort=None):
     """Read GRBL responses until ok (returns None) or error/ALARM (returns
-    the message). Status chatter like <Idle|WPos:...> is ignored."""
-    while True:
+    the message). Status chatter like <Idle|WPos:...> is ignored.
+
+    Quiet reads are tolerated until timeout_s: synchronising commands (M5,
+    coolant, etc.) only answer ok after all buffered motion finishes, which
+    can take tens of seconds mid-job. Returns 'aborted' if the abort event
+    is set while waiting."""
+    end = time.time() + timeout_s
+    while time.time() < end:
+        if abort is not None and abort.is_set():
+            return "aborted"
         resp = ser.readline().decode(errors="ignore").strip()
         if resp == "ok":
             return None
@@ -475,8 +479,9 @@ def await_ok(ser, context=""):
             app_log(f"RX {resp}")
             return resp
         if not resp:
-            raise TimeoutError(f"no response from GRBL {context}".strip())
+            continue  # machine still executing buffered motion — keep waiting
         app_log(f"RX {resp}")  # <status> reports, [MSG:...], banner: keep reading
+    raise TimeoutError(f"no response from GRBL {context}".strip())
 
 
 class WebSocketLink:
@@ -690,7 +695,14 @@ def stream_gcode(ser, lines, on_progress=None, abort=None, home=False):
             return i - 1, errors
         app_log(f"TX {cmd}")
         ser.write((cmd + "\n").encode("ascii"))
-        if await_ok(ser, f"at line {i} ({cmd!r})"):
+        result = await_ok(ser, f"at line {i} ({cmd!r})", abort=abort)
+        if result == "aborted":
+            app_log("ABORT while waiting: feed hold + soft reset")
+            ser.write(b"!")
+            time.sleep(0.2)
+            ser.write(b"\x18")
+            return i - 1, errors
+        if result:
             errors += 1
         if on_progress:
             on_progress(i, len(cmds))
@@ -806,7 +818,6 @@ SETTINGS_FIELDS = [
     ("plunge_rate", "Plunge Rate (mm/min)"),
     ("spindle_rpm", "Spindle RPM"),
     ("laser_power", "Laser Power (S value)"),
-    ("frame_power", "Frame Power (S value, laser dry run)"),
     ("cutout_padding", "Cutout Padding (mm)"),
     ("laser_kerf", "Laser Kerf (mm)"),
     ("tab_width", "Tab Width (mm, 0 = no tabs)"),

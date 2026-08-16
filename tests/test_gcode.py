@@ -229,10 +229,13 @@ class DryRunTests(unittest.TestCase):
         self.assertNotIn("M4", text)
         self.assertEqual(z_values(g), [SETTINGS["safe_z"]], "only move Z to safe height")
 
-    def test_laser_frame_uses_frame_power_no_z(self):
+    def test_laser_dry_run_no_power_no_z(self):
         s = dict(SETTINGS, tool_mode="Laser")
         g = app.generate_dry_run_lines(self._layout(), s)
-        self.assertIn(f"M4 S{s['frame_power']:.0f}", "\n".join(g))
+        text = "\n".join(g)
+        self.assertNotIn("M3", text, "dry run must never power the tool")
+        self.assertNotIn("M4", text, "dry run must never power the tool")
+        self.assertIn("M5", text)
         self.assertEqual(z_values(g), [])
 
     def test_dry_run_bounds_match_job_bounds(self):
@@ -328,7 +331,10 @@ ok""".splitlines()
         ])))
         self.assertEqual(app.await_ok(FakeSerial(["error:3"])), "error:3")
         with self.assertRaises(TimeoutError):
-            app.await_ok(FakeSerial([]))
+            app.await_ok(FakeSerial([]), timeout_s=0.2)
+        # Quiet reads while buffered motion executes (e.g. waiting on M5's
+        # planner sync) must be tolerated, not treated as a dead link
+        self.assertIsNone(app.await_ok(FakeSerial(["", "", "", "ok"]), timeout_s=2))
 
     def test_link_kind_classification(self):
         self.assertEqual(app.link_kind("COM3"), "serial")
