@@ -337,6 +337,28 @@ ok""".splitlines()
         self.assertEqual(app.link_kind("http://192.168.1.207"), "esp3d")
         self.assertEqual(app.link_kind("ws://192.168.1.207:81"), "ws")
 
+    def test_home_machine_waits_through_slow_cycle(self):
+        class FakeSerial:
+            def __init__(self, responses):
+                self.responses = list(responses)
+                self.written = []
+
+            def write(self, data):
+                self.written.append(data)
+
+            def readline(self):
+                return (self.responses.pop(0) + "\n").encode() if self.responses else b""
+
+        ok_ser = FakeSerial(["", "", "<Home|MPos:0,0,0>", "ok"])
+        self.assertIsNone(app.home_machine(ok_ser, timeout_s=2))
+        self.assertEqual(ok_ser.written, [b"$H\n"])
+
+        alarm = FakeSerial(["ALARM:8"])
+        self.assertEqual(app.home_machine(alarm, timeout_s=2), "ALARM:8")
+
+        with self.assertRaises(TimeoutError):
+            app.home_machine(FakeSerial([]), timeout_s=0.2)
+
     def test_normalize_target_forgives_missing_slashes(self):
         self.assertEqual(
             app.normalize_target("ws:192.168.1.207:81"), "ws://192.168.1.207:81"

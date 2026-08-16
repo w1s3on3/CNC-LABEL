@@ -642,13 +642,39 @@ def open_grbl(target, baud):
     return link
 
 
-def stream_gcode_serial(port, baud, lines, on_progress=None, abort=None):
+def home_machine(ser, timeout_s=90):
+    """Run GRBL's homing cycle ($H) and wait for it to finish. Homing can
+    take a long time, so empty reads are tolerated until timeout_s. Returns
+    None on success or the GRBL error/ALARM message."""
+    app_log("TX $H (homing…)")
+    ser.write(b"$H\n")
+    end = time.time() + timeout_s
+    while time.time() < end:
+        resp = ser.readline().decode(errors="ignore").strip()
+        if resp == "ok":
+            app_log("Homing complete")
+            return None
+        if resp.startswith(("error", "ALARM")):
+            app_log(f"RX {resp}")
+            return resp
+        if resp:
+            app_log(f"RX {resp}")
+    raise TimeoutError(f"homing did not complete within {timeout_s}s")
+
+
+def stream_gcode_serial(port, baud, lines, on_progress=None, abort=None, home=False):
     """Stream a job to GRBL call-and-response style (send a line, wait for
     ok). Simple and reliable for label-sized jobs. Returns (sent, errors).
-    Setting the abort event feed-holds then soft-resets the controller."""
+    Setting the abort event feed-holds then soft-resets the controller.
+    With home=True, a $H homing cycle runs first — nothing is streamed
+    unless it succeeds."""
     cmds = sendable_lines(lines)
     errors = 0
     with open_grbl(port, baud) as ser:
+        if home:
+            err = home_machine(ser)
+            if err:
+                raise RuntimeError(f"homing failed ({err}) — nothing was sent")
         app_log(f"Streaming {len(cmds)} lines")
         for i, cmd in enumerate(cmds, 1):
             if abort is not None and abort.is_set():
@@ -1067,7 +1093,11 @@ def main():
         Checkbutton(
             win, text="Dry run only (boundary trace, no cutting)", variable=dry_var
         ).grid(row=3, column=0, columnspan=3, sticky="w")
-        status = Label(win, text="Home/zero the machine first, then Send",
+        home_var = tk.BooleanVar(value=True)
+        Checkbutton(
+            win, text="Home ($H) before send", variable=home_var
+        ).grid(row=3, column=2, sticky="w")
+        status = Label(win, text="Set your work zero, then Send",
                        wraplength=380, justify="left")
         status.grid(row=4, column=0, columnspan=3, pady=4)
         abort_event = threading.Event()
@@ -1087,12 +1117,12 @@ def main():
                 messagebox.showerror("Error", "Baud must be a number")
                 return None
 
-        def send_worker(port, baud, lines):
+        def send_worker(port, baud, lines, home):
             try:
                 sent, errors = stream_gcode_serial(
                     port, baud, lines,
                     on_progress=lambda i, n: set_status(f"Sending… {i}/{n}"),
-                    abort=abort_event,
+                    abort=abort_event, home=home,
                 )
                 if abort_event.is_set():
                     set_status(f"Aborted after {sent} lines — machine was reset")
@@ -1127,7 +1157,8 @@ def main():
             busy[0] = True
             set_status("Connecting…")
             threading.Thread(
-                target=send_worker, args=(conn(), baud, lines), daemon=True
+                target=send_worker,
+                args=(conn(), baud, lines, home_var.get()), daemon=True,
             ).start()
 
         def open_grbl_settings():

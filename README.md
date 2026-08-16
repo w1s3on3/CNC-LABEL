@@ -169,6 +169,7 @@ The **📡 Machine** button talks to a GRBL 1.1 controller directly, over any of
 | `ws://host:81` | Raw bidirectional websocket GRBL (FluidNC / GRBL_ESP32) |
 
 - Pick the connection, then **Send**
+- **Home ($H) before send** is ticked by default: the machine runs its homing cycle first, and nothing is streamed unless homing succeeds (untick it if your machine has no homing switches / `$22=0`)
 - **Dry run only** is ticked by default — the first send traces the job boundary at Safe Z / Frame Power so you can check placement before cutting anything
 - Streaming is call-and-response (each line waits for GRBL's `ok`), with live progress and an **Abort** button that feed-holds (`!`) and soft-resets (`Ctrl-X`) the controller
 - **Home/zero the machine first** — the app sends the job as-is against your current work zero
