@@ -513,6 +513,11 @@ class WebSocketLink:
             data = data.decode("latin-1")
         self.ws.send(data)
 
+    # ESP3D keepalive/control frames arrive as standalone text frames with no
+    # trailing newline; gluing them into the line buffer corrupts adjacent
+    # GRBL responses (seen live: 'PING:0' + 'ok\r\n' became 'PING:0ok')
+    CONTROL_FRAME = re.compile(r"^(PING|CURRENT_ID|ACTIVE_ID):\S*$")
+
     def readline(self):
         while b"\n" not in self.buffer:
             try:
@@ -520,6 +525,8 @@ class WebSocketLink:
             except Exception:  # timeout / closed: report like a serial timeout
                 return b""
             if isinstance(frame, str):
+                if self.CONTROL_FRAME.match(frame.strip()):
+                    continue
                 frame = frame.encode("latin-1", errors="replace")
             self.buffer += frame
         line, _, self.buffer = self.buffer.partition(b"\n")

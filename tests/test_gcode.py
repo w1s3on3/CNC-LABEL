@@ -415,6 +415,26 @@ ok""".splitlines()
         self.assertEqual(lines, ["$0=10", "$1=5", "ok", "<Idle|WPos:0,0,0>"])
         self.assertEqual(link.readline(), b"", "timeout must read as empty like serial")
 
+    def test_websocket_drops_esp3d_control_frames(self):
+        # Seen on the live machine: a newline-less PING frame arriving right
+        # before 'ok' must not corrupt it into 'PING:0ok'
+        link = object.__new__(app.WebSocketLink)
+        link.buffer = b""
+        link.timeout = 5
+
+        class FakeWS:
+            def __init__(self, frames):
+                self.frames = list(frames)
+
+            def recv(self):
+                if not self.frames:
+                    raise TimeoutError()
+                return self.frames.pop(0)
+
+        link.ws = FakeWS(["PING:0", "ok\r\n", "CURRENT_ID:2", "ACTIVE_ID:1", "error:15\r\n"])
+        self.assertEqual(link.readline().decode().strip(), "ok")
+        self.assertEqual(link.readline().decode().strip(), "error:15")
+
 
 if __name__ == "__main__":
     unittest.main()
